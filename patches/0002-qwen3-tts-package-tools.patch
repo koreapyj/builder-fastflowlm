@@ -1,0 +1,2126 @@
+tools/qwen3_tts: model package build, detector calibration, client, README
+
+Builds the Qwen3-TTS NPU model package flm loads (talker AWQ+GPTQ Q4NX,
+code predictor Q4NX, host tensors, speech decoder, tokenizer, package.json
+with the garble detector settings) from the Hugging Face checkpoint;
+calibrates the detector's entropy threshold on the NPU; test client for the
+speech endpoints; README (build, run, API, limitations).
+Python only; nothing here is built or installed by CMake.
+
+diff --git a/src/tools/qwen3_tts/README.md b/src/tools/qwen3_tts/README.md
+new file mode 100644
+index 00000000..682368ec
+--- /dev/null
++++ b/src/tools/qwen3_tts/README.md
+@@ -0,0 +1,270 @@
++# Qwen3-TTS on the NPU
++
++Text-to-speech with [Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) in FastFlowLM. The talker and the code predictor run on the NPU through FLM's prebuilt `qwen3_npu` engine; text and codec embeddings, heads, sampling and the speech decoder run on the CPU. It serves `POST /v1/audio/speech` (OpenAI / vLLM-Omni shape), a WebSocket endpoint for streaming LLM output into speech, and `flm run` for speaking text to WAV files.
++
++## Validated versions
++
++| | |
++|---|---|
++| FastFlowLM base commit | `d8767c0a08febd4037356546d2df1bba99bba76e` |
++| `src/lib/xrt/libqwen3_npu.so` | sha256 `1a3ee945bbbdfdecd2a2bfc90a5c5d29e2df8fc4d63f3d67dcc9a83cbc5dd547` |
++| `src/lib/xrt/libq4_npu_eXpress.so` | `58666857753dae8c4e52bebea2063d09fed56971e43b67040f758cc9855dd136` |
++| `src/lib/xrt/libmha.so` | `35b41c0754dff57eefe9c0ddbddfc65151f11769458a4437f4700f2f1973dc81` |
++| `src/lib/xrt/libdequant.so` | `c89ae39e7fe76e7ef8c3e0cdb5141311b6b43dd3b624ec8bb195a6a91e6d6f58` |
++| `src/lib/xrt/libgemm.so` | `4edc9b8ad41059ced21d0b21ce08214fdc784fe4057aa667c10995d1177dad67` |
++| `src/lib/xrt/liblm_head.so` | `ed5d6e230ec184a47922b9ee540e7248160488f9e9efab411cf0e6e8f91fd0f4` |
++| `src/xclbins/Qwen3-1.7B-NPU2/` | attn `88ad573e…`, dequant `575d45e4…`, layer `3f86d2c3…`, mm `4afc2a6f…` |
++| `src/xclbins/Qwen3-0.6B-NPU2/` | attn `88ad573e…`, dequant `575d45e4…`, layer `9e084785…`, mm `4afc2a6f…` |
++| checkpoint | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` revision `0c0e3051f131929182e2c023b9537f8b1c68adfe` |
++| system | Ryzen AI Max+ 395 (Strix Halo), Ubuntu kernel 7.0.0-38, XRT 2.25.0 (`libxrt2`, `libxrt-npu2`), amdxdna firmware `npu_7.sbin` |
++
++The engine binaries and xclbins are part of the FLM tree at the base commit, so a build from that commit plus these patches uses exactly them.
++
++## Building FLM
++
++```bash
++git clone https://github.com/ROCm/FastFlowLM.git && cd FastFlowLM
++git checkout d8767c0a08febd4037356546d2df1bba99bba76e
++git submodule update --init --recursive
++git am /path/to/patches/*.patch
++cd src && cmake --preset linux-default && cmake --build build -j
++```
++
++Build requirements are FLM's usual ones (Boost incl. program_options, FFmpeg, libcurl, libedit, XRT headers, Rust for tokenizers-cpp) plus a compiler with AVX-512 BF16 support (GCC 12 or newer). Text-to-speech is built on Linux with the XRT runtime only (`FLM_USE_HRX=OFF`); elsewhere `flm` builds without it. CPU-only unit tests for the text segmentation:
++
++```bash
++cmake -S src/test/qwen3_tts -B build-tts-test && cmake --build build-tts-test && build-tts-test/test_tts_text
++```
++
++## Model package
++
++`flm` looks for the package in `$FLM_MODEL_PATH/models/Qwen3-TTS-12Hz-1.7B-CustomVoice-NPU2/` (default `~/.config/flm/models/...`). It is not downloadable; build it with the scripts in this directory (`flm pull qwen3-tts:1.7b` only checks it).
++
++Builds the model package FastFlowLM loads for `Qwen3-TTS-12Hz-1.7B-CustomVoice`. The talker
++(28-layer, Qwen3-1.7B-shaped) and the code predictor (5-layer, Qwen3-0.6B-shaped) are
++packaged as stock Qwen3 Q4NX models for the prebuilt `qwen3_npu` engine: their embedding
++tables are zero scratch rows (the runtime injects each input embedding) and `lm_head` is an
++identity, so the engine returns final hidden states. Everything else runs on the host.
++The generated weights are build outputs and are not committed.
++
++### Prerequisites
++
++- Linux x86-64, Python 3.12, 24 GB RAM (peak 21 GB: the FP32 model plus calibration statistics).
++- The Python environment in `requirements.txt` (CPU-only torch):
++  ```
++  uv venv --python 3.12 venv && VIRTUAL_ENV=$PWD/venv uv pip install --index-strategy unsafe-best-match -r requirements.txt
++  ```
++  (`pip install -r requirements.txt` works too.)
++- The Hugging Face checkpoint at the revision the package was validated with:
++  ```
++  hf download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --revision 0c0e3051f131929182e2c023b9537f8b1c68adfe --local-dir Qwen3-TTS-12Hz-1.7B-CustomVoice
++  ```
++  `model.safetensors` sha256 `38b1d5971bdbd982b561cccec982669a53b0537c3cf5e9bd4778ed07bb2f5137`.
++  The build itself downloads nothing (it runs with `HF_HUB_OFFLINE=1`).
++
++### Build
++
++```
++PYTHON=venv/bin/python [CPU_LIST=8-15] ./build_package.sh Qwen3-TTS-12Hz-1.7B-CustomVoice \
++    $FLM_MODEL_PATH/<model_path>/Qwen3-TTS-12Hz-1.7B-CustomVoice-NPU2 [--threads 8] [--work DIR]
++```
++
++It takes about 1 h 55 min on 8 cores of a Ryzen AI MAX+ 395: trajectories 80 min, official
++calibration runs 23 min, talker quantization 8 min, teacher-forced capture 3 min, everything
++else seconds. Disk: 3.5 GB for the package plus 15 GB of intermediates in `<out>.work`
++(delete it afterwards). The build resumes at the first unfinished step after an interruption
++and ends by printing the sha256 of every package file. With the same thread count, CPU and
++environment, every file is byte-identical between builds.
++
++### Steps and outputs
++
++| step | script | produces |
++|---|---|---|
++| checkpoint | `sha256sum` | `<work>/model.sha256`; warns if it is not the validated revision |
++| config | python | `config.json`: original HF config (speaker and language ids are read from it) plus `flm_version` |
++| tokenizer | `export_tokenizer.py` | `tokenizer.json`: the text tokenizer exactly as qwen_tts loads it, checked against it with the `tokenizers` library |
++| host | `trim_host.py` | `host.safetensors`: every `talker.*` tensor except the transformer layers (BF16) |
++| speech_tokenizer | `cp` | `speech_tokenizer.safetensors`: the 12 Hz codec decoder |
++| predictor | `make_predictor.py` | `Qwen3-0.6B-NPU2/`: code predictor, min/max Q4NX (seconds) |
++| calib_runs | `capture_calib.py` | `<work>/calib_runs`: talker linear-input statistics from 28 official FP32 runs (`calib_runs.json`) |
++| trajectories | `gen_trajectories.py` | `<work>/trajectories`: 150 FP32 code trajectories (50 sentences of `calib_trajectories.json` x seeds 0-2), official pipeline, default sampling |
++| calib_tf | `capture_tf.py` | `<work>/calib_all`: the trajectories teacher-forced through the FP32 talker, added to the statistics |
++| talker | `quantize_talker.py` | `Qwen3-1.7B-NPU2/`: talker, AWQ + GPTQ Q4NX |
++| package_json | `write_package_json.py` | `package.json`: source repo, revision, checkpoint sha256, quantization method, and the garble detector settings from `detector.json` (with their reason and calibration record) |
++
++The engine directories must keep the names `Qwen3-1.7B-NPU2` and `Qwen3-0.6B-NPU2`: the
++engine selects its xclbins by that basename. Their `config.json` files are the stock FastFlowLM
++configs in `configs/` (from the `FastFlowLM/Qwen3-1.7B-NPU2` and `FastFlowLM/Qwen3-0.6B-NPU2`
++model repos) with the layer count and vocabulary set for the TTS sub-models. `q4nx.py` is the
++Q4NX writer shared by both packagers.
++
++The calibration sentences do not overlap the evaluation sentences (`calib_runs.json` rows are
++`[text, speaker, language]`, `calib_trajectories.json` rows `[id, text, speaker, language]`). The official pipeline's
++tokenizer (transformers 4.57.3, `fix_mistral_regex=True`) uses a different pre-tokenizer
++regex from a plain `AutoTokenizer`; it only changes English contractions and case runs, and
++`tokenizer.json` follows the official pipeline.
++
++The package used to validate this integration was quantized from trajectories generated by an earlier C++ FP32 tool; this pipeline generates them with the official Python pipeline instead (same model and sampling). The resulting talker is not byte-identical to the validated one; on the NPU its teacher-forced KL against the FP32 model is 0.073 (validated package 0.069; plain GPTQ 0.079, MSE 0.090), argmax agreement 86.9% (87.5%). On the derail harness (8 sentences x 28 seeds, deployed path: fast dispatch, NPU predictor, repetition penalty 1.05; FP32 model 1.8%) it derails in 4.0% of runs (95% CI 2-7%) against 2.7% (1-6%) for the validated package, a difference of 3 runs in 224 that is within sampling noise; its pitch range is slightly closer to FP32 (8.18 vs 8.19 semitones; validated 7.92).
++
++## Running
++
++```bash
++# speak lines typed at the prompt to flm_tts_000.wav, flm_tts_001.wav, ... (/voice, /lang, /voices, /bye)
++flm run qwen3-tts:1.7b
++# speak a text file to story.txt.wav
++flm run qwen3-tts:1.7b -i story.txt
++
++# text-to-speech server only
++flm serve qwen3-tts:1.7b
++# or next to a chat model
++flm serve qwen3:8b --tts qwen3-tts:1.7b
++```
++
++Loading takes about 6 s (both NPU engines, every speaker's voice prefix, one warm-up utterance). Measured on the validated machine (Ryzen AI Max+ 395) with this build:
++
++| | solo | LLM generating on the iGPU at the same time |
++|---|---|---|
++| time to first audio, from when the first segment's text is available | 59-73 ms | 75-125 ms (memory-bandwidth contention) |
++| generation time per 80 ms frame (mean) | 45-50 ms | 47-51 ms |
++| playback underruns (WebSocket, LLM output paced on `lead`) | | 0 in 7 replies, 26-118 s each |
++
++TTS runs on its own threads, pinned by default to CPUs 0-7 (host heads, embeddings, generator) and 8-11 (speech decoder). Environment overrides:
++
++| variable | default | |
++|---|---|---|
++| `FLM_TTS_CPUS` | `0-7` | host thread pool; the first CPU runs the generator |
++| `FLM_TTS_DEC_CPUS` | `8-11` | speech decoder thread pool |
++| `FLM_TTS_TEMPERATURE` | `0.9` | sampling temperature (talker and code predictor) |
++| `FLM_TTS_ENTROPY` | `package.json` `detector` | override the garble detector's entropy threshold (nats), for experiments |
++| `FLM_TTS_CALIBRATION_DIR` | unset | calibration mode: checks and retries off, every segment recorded there (see below) |
++| `FLM_TTS_WARMUP` | `1` | `0` skips the warm-up utterance at load |
++| `FLM_TTS_KEEPWARM_S` | `600` | for this long after an utterance, a tiny NPU dispatch every 4 s keeps the NPU from runtime-suspending (resuming adds ~135 ms to the next time to first audio); `0` disables |
++| `FLM_TTS_DEBUG` | unset | `flm run`: print each segment's check result |
++
++Test client (needs `pip install websockets==15.0.1`):
++
++```bash
++python tts_client.py speak "こんにちは。" -o hello.wav                    # HTTP, streamed audio
++python tts_client.py stream --file story.txt -o story.wav                 # WebSocket, text fed in pieces
++LLM_API_KEY=... python tts_client.py llm --llm-url https://host/v1 --llm-model MODEL \
++    --prompt "京都でおすすめの観光地を教えて。" --paced -o reply.wav       # LLM output spoken as it streams
++```
++
++It reports time to first audio, playback underruns, cancel latency (`--cancel-after S`) and the server's metrics.
++
++## API
++
++### `POST /v1/audio/speech`
++
++OpenAI / vLLM-Omni request shape:
++
++```bash
++curl -s http://127.0.0.1:52625/v1/audio/speech -H 'Content-Type: application/json' \
++  -d '{"input": "こんにちは。今日はいい天気ですね。", "voice": "ono_anna", "response_format": "wav"}' -o hello.wav
++```
++
++| field | | |
++|---|---|---|
++| `input` | required | text to speak |
++| `voice` | `ono_anna` | speaker: `vivian`, `serena`, `uncle_fu`, `dylan`, `eric`, `ryan`, `aiden`, `ono_anna`, `sohee` |
++| `language` | the speaker's own language | `japanese`, `english`, `chinese`, `korean`, ..., or `auto` |
++| `response_format` | `wav` | `wav` or `pcm` (16-bit little-endian, 24 kHz, mono) |
++| `stream` | `false` | `true`: stream as it is generated |
++| `stream_format` | `sse` when `stream` | `audio`: raw chunked WAV/PCM bytes; `sse`: `speech.audio.delta` / `speech.audio.done` events with base64 PCM |
++| `seed` | random | sampling seed |
++| `temperature` | `0.9` | |
++| `replace` | `false` | cancel the utterance being spoken and speak this one instead |
++| `model` | | optional; must be the loaded TTS model (or `tts-1`) |
++
++`speed` (only 1.0), `sample_rate` (only 24000) and `task_type` (only `CustomVoice`) are accepted for compatibility. `instructions` are refused (this build has no instruction-tuned tones).
++
++Responses carry `x-audio-sample-rate` and `x-audio-channels`; a whole-file response also carries `x-flm-tts-metrics` (JSON: audio seconds, time to first audio, segments, retries, frame timing).
++
++### `GET /v1/audio/speech/stream` (WebSocket)
++
++For speaking text while it is still being produced, e.g. LLM output. Client to server (JSON text frames):
++
++| message | |
++|---|---|
++| `{"type": "session.config", "voice", "language", "seed", "temperature", "replace", "events"}` | optional; sticky for later utterances |
++| `{"type": "input.text", "text": "..."}` | more text; the first one starts an utterance |
++| `{"type": "input.done"}` | no more text for this utterance |
++| `{"type": "input.cancel"}` | stop the current utterance now |
++| `{"type": "session.close"}` | |
++
++Server to client:
++
++| message | |
++|---|---|
++| `{"type": "audio.start", "utterance_index", "format": "pcm", "sample_rate": 24000, "channels": 1}` | before the first audio |
++| binary frames | 16-bit little-endian mono PCM |
++| `{"type": "lead", "lead": n, "consumed": c, "segment": k}` | text tokens received but not yet spoken |
++| `{"type": "segment", ...}` | per segment attempt: text, frames, check result, retry |
++| `{"type": "audio.done", "utterance_index", "total_bytes", "error", "status", "metrics"}` | `status`: `ok`, `cancelled`, `error` or `npu_fault` |
++| `{"type": "session.done", "utterance_index"}` | |
++| `{"type": "error", "message"}` | |
++
++Text supply. The talker reads 12.5 text tokens per second of speech. When it runs out of text before `input.done` it waits (no padding, which would change the speech), and a long wait can be heard as a gap. Keep the lead at 8 tokens or more. A still-open segment does not start until 8 tokens are available. An LLM generates several times faster than speech, so the simplest client streams the whole reply; a client that paces the LLM should ask for more text when `lead` falls below 8.
++
++### Other endpoints
++
++| | |
++|---|---|
++| `GET /v1/audio/voices` | voices, languages, default voice, sample rate |
++| `POST /v1/audio/speech/cancel` | stop the utterance being spoken (HTTP or WebSocket) |
++
++### One utterance at a time
++
++While an utterance is being spoken, a new request (HTTP or WebSocket) is refused with 409, unless it sets `"replace": true`, which cancels the current one first. Cancelling (`input.cancel`, `/v1/audio/speech/cancel`, or closing the connection) stops generation within one frame (80 ms of audio). Each utterance holds FLM's NPU lock while it runs, so chat and TTS requests take turns.
++
++## How text is spoken
++
++- Normalization: markdown symbols and list bullets are dropped. A space between two Japanese/Chinese characters becomes 。, because LLMs sometimes separate Japanese sentences with spaces only. Latin and Korean spacing is kept.
++- Segments: text is cut only at sentence ends (。！？… and `.`/`!`/`?` before a space, or a newline), never at commas. Short sentences are merged until a segment has at least 17 text tokens, because very short segments fail about 4 times as often; the last segment of a text may be shorter. A run of more than 200 tokens without a sentence end is cut after its last comma.
++- Each segment is generated from the voice's cached prompt, followed by a pause (350 ms after a sentence end, 150 ms after a comma cut). Its loudness is matched to the first segment's, within ±6 dB.
++- Checks and retries: about one segment in 100 (one per ~25 min of audio) derails into garbled speech. The base model does this too in full precision. Each segment is checked while it is generated: talker code0 entropy over 25 frames, length against the text, and a hard frame cap of 7.5 × tokens + 15. The first segment streams immediately, so a failure there is heard; it is cut where detected and spoken again. Later segments are generated ahead, at most two segments ahead of playback, and checked before they are sent. A failed one is regenerated with another seed, up to 2 retries, without being heard. If playback would run dry first, the attempt in progress streams instead.
++
++In measured LLM-paced runs, 82% of later segments (50 of 61) were checked before playback; the rest streamed unchecked because playback would otherwise have run dry.
++
++LLM guidance: use a plain spoken-style system prompt, e.g. 「あなたは親切な日本語のアシスタントです。音声で読み上げられるので、記号や箇条書きを使わず、自然な話し言葉の文章だけで答えてください。」. Avoid prompts that ask for very short replies: one-word sentences are merged by the segmenter, but a reply that is a single short sentence is spoken as one short segment, which is the case that fails most.
++
++## Recalibrating the garble detector
++
++The entropy threshold (1.7 nats) and the other detector settings live in the package's `package.json` under `detector`, copied from `detector.json` when the package is built; `flm` reads them at load. `detector.json` records why: the selection rule, the clean/failed statistics, and the data it came from. The threshold depends on the talker package and the NPU numerics, so recalibrate after changing either (a requantized or fine-tuned talker, e.g. per-tone LoRA, or a new `qwen3_npu` engine build). Uncalibrated, the FP32 model's value (1.36) flags 6.4% of clean NPU segments.
++
++```bash
++FLM_TTS_CALIBRATION_DIR=$PWD/cal flm serve qwen3-tts:1.7b &        # checks off, segments recorded
++python calibrate_entropy.py generate --dir cal --seeds 6           # 32 replies x 6 seeds, segmented as in production
++# stop flm, then
++python calibrate_entropy.py label --dir cal --threads 8            # Whisper CER per segment
++python calibrate_entropy.py fit --dir cal                          # threshold table and pick
++python calibrate_entropy.py write --dir cal --package $FLM_MODEL_PATH/models/Qwen3-TTS-12Hz-1.7B-CustomVoice-NPU2 [--update-default]
++```
++
++`generate` speaks `calib_entropy_texts.json` (32 Japanese LLM replies, not used for quantization), about 3 h of audio for 6 seeds; `label` needs the packaging environment plus the Whisper model and takes about 3 h on 8 threads. The rule (lowest threshold on a 0.1 grid with at most 0.75% false positives on clean segments) reproduces 1.7 from the original calibration data. `write` replaces the package's `detector` block, recording date, data and rates; `--update-default` also rewrites `detector.json` so later package builds carry the new value.
++
++## NPU faults
++
++TTS watches for NPU failures:
++- an XRT error;
++- an NPU step that does not finish within 2 s;
++- an `amdxdna` error/fail/timeout line in the kernel log (followed with `journalctl -k -f`, so the user running flm needs read access to the journal, e.g. membership in `adm` or `systemd-journal`).
++
++When one occurs, TTS stops for good. The current utterance ends with `npu_fault`, later requests get 503, and the reason is logged. The other models in the process are not touched. Recovery is manual:
++
++```bash
++journalctl -k | grep amdxdna                           # what happened
++sudo modprobe -r amdxdna && sudo modprobe amdxdna      # if the NPU does not recover on its own (stop flm first)
++# then restart flm
++```
++
++## Known limitations
++
++- Linux with the XRT runtime only. The integration drives FLM's prebuilt `qwen3_npu` engine through interposed XRT calls; it is validated against the engine libraries and xclbins listed under "Validated versions" and checks the engine's build shape at load (it refuses to start if that changes). Other engine builds are untested.
++- Preset speakers of Qwen3-TTS-12Hz-1.7B-CustomVoice only: no instructions/tones, voice design or voice cloning.
++- 24 kHz mono 16-bit PCM or WAV only; `speed` 1.0 only.
++- Audible failures remain. About 1 segment in 100 garbles. Later segments are usually caught and regenerated unheard; first segments and segments the detector misses are heard. Expect a few audible glitches per hour of speech.
++- The garble detector's entropy threshold (1.7) was calibrated on the validated talker package (ASR-labeled LLM-reply segments), not on the reproducible one this pipeline builds. A spot check on the reproducible talker (the 224 derail-harness runs, code0 entropy teacher-forced through the NPU talker): 2 of 215 clean runs (0.9%) exceed 1.7 (validated calibration: 0.7%); of the 9 derailed runs, the entropy check flags 4 and the entropy and length checks together flag 8. The harness labels derails by length, code0 loops and leading silence rather than ASR, so this is a consistency check, not a recalibration. Recalibrate with `calibrate_entropy.py` (about 5 h) together with the next talker change (per-tone LoRA).
++- Prosody can jump at segment joins, because each segment is generated independently (pitch jumps about 2× larger than within a segment). The per-tone LoRA work is meant to address this.
++- One utterance at a time; queued chat requests wait for it, and the other way round.
++- Memory: about 4.6 GB resident for a TTS-only `flm serve`.
+diff --git a/src/tools/qwen3_tts/build_package.sh b/src/tools/qwen3_tts/build_package.sh
+new file mode 100755
+index 00000000..cca18f8d
+--- /dev/null
++++ b/src/tools/qwen3_tts/build_package.sh
+@@ -0,0 +1,145 @@
++#!/usr/bin/env bash
++# Build the Qwen3-TTS-12Hz-1.7B-CustomVoice NPU model package for FastFlowLM.
++#
++# usage: build_package.sh <hf_model_dir> <out_package_dir> [--threads N] [--work DIR]
++#   hf_model_dir     local snapshot of Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice (see README.md)
++#   out_package_dir  e.g. $FLM_MODEL_PATH/<model_path>/Qwen3-TTS-12Hz-1.7B-CustomVoice-NPU2
++#   --threads N      CPU threads for torch (default 8); outputs are bit-reproducible for a
++#                    fixed thread count, CPU and requirements.txt environment
++#   --work DIR       intermediates (calibration statistics, ~15 GB; default <out>.work)
++# environment:
++#   PYTHON    interpreter with requirements.txt installed (default: python3)
++#   CPU_LIST  optional taskset CPU list to pin every step to (e.g. 8-15)
++#
++# Nothing is downloaded. Every step writes to a temporary name and records a marker in
++# <work>/done/ when it finishes, so an interrupted build resumes at the first unfinished step.
++set -euo pipefail
++
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++KNOWN_SHA256=38b1d5971bdbd982b561cccec982669a53b0537c3cf5e9bd4778ed07bb2f5137
++KNOWN_REVISION=0c0e3051f131929182e2c023b9537f8b1c68adfe
++REPO=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
++
++usage() { sed -n '4,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
++[ $# -ge 2 ] || usage
++HF="$(cd "$1" && pwd)"
++OUT="$2"
++shift 2
++THREADS=8
++WORK=""
++while [ $# -gt 0 ]; do
++    case "$1" in
++        --threads) THREADS="$2"; shift 2 ;;
++        --work) WORK="$2"; shift 2 ;;
++        *) usage ;;
++    esac
++done
++mkdir -p "$OUT"
++OUT="$(cd "$OUT" && pwd)"
++WORK="${WORK:-$OUT.work}"
++mkdir -p "$WORK/done"
++WORK="$(cd "$WORK" && pwd)"
++
++PYTHON="${PYTHON:-python3}"
++export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
++export OMP_NUM_THREADS="$THREADS" MKL_NUM_THREADS="$THREADS"
++PIN=()
++[ -n "${CPU_LIST:-}" ] && PIN=(taskset -c "$CPU_LIST")
++py() { "${PIN[@]}" "$PYTHON" -I "$@"; }
++
++for f in config.json generation_config.json model.safetensors vocab.json merges.txt tokenizer_config.json \
++         speech_tokenizer/config.json speech_tokenizer/model.safetensors; do
++    [ -f "$HF/$f" ] || { echo "missing $HF/$f" >&2; exit 1; }
++done
++
++# step <name> <command...>: run once, record wall time
++step() {
++    local name="$1"; shift
++    if [ -f "$WORK/done/$name" ]; then
++        echo "== $name: done ($(cat "$WORK/done/$name"))"
++        return
++    fi
++    echo "== $name"
++    local t0=$SECONDS
++    "$@"
++    echo "$((SECONDS - t0)) s" > "$WORK/done/$name"
++    echo "== $name: $((SECONDS - t0)) s"
++}
++
++s_checkpoint() {
++    sha256sum "$HF/model.safetensors" | cut -d' ' -f1 > "$WORK/model.sha256.tmp"
++    mv "$WORK/model.sha256.tmp" "$WORK/model.sha256"
++    if [ "$(cat "$WORK/model.sha256")" != "$KNOWN_SHA256" ]; then
++        echo "warning: model.safetensors is not $REPO@$KNOWN_REVISION; continuing" >&2
++    fi
++}
++
++# original HF config plus the minimum FLM version that can load the package (flm reads
++# flm_version from every model's config.json)
++s_config() {
++  "$PYTHON" -I -c 'import json, sys; c = json.load(open(sys.argv[1])); c["flm_version"] = sys.argv[3]
++json.dump(c, open(sys.argv[2], "w"), indent=2, ensure_ascii=False)' "$HF/config.json" "$OUT/config.json.tmp" 1.0.9 \
++    && mv "$OUT/config.json.tmp" "$OUT/config.json"
++}
++
++s_tokenizer() { py "$HERE/export_tokenizer.py" "$HF" "$OUT/tokenizer.json"; }
++
++s_host() {
++    py "$HERE/trim_host.py" "$HF" "$OUT/host.safetensors.tmp"
++    mv "$OUT/host.safetensors.tmp" "$OUT/host.safetensors"
++}
++
++s_speech_tokenizer() {
++    cp "$HF/speech_tokenizer/model.safetensors" "$OUT/speech_tokenizer.safetensors.tmp"
++    mv "$OUT/speech_tokenizer.safetensors.tmp" "$OUT/speech_tokenizer.safetensors"
++}
++
++# packaged engine models are built under <work> and moved into <out> when complete
++s_predictor() {
++    rm -rf "$WORK/predictor" "$OUT/Qwen3-0.6B-NPU2"
++    py "$HERE/make_predictor.py" "$HF" "$WORK/predictor/Qwen3-0.6B-NPU2" --threads "$THREADS"
++    mv "$WORK/predictor/Qwen3-0.6B-NPU2" "$OUT/" && rmdir "$WORK/predictor"
++}
++
++s_calib_runs() {
++    rm -rf "$WORK/calib_runs.tmp"
++    py "$HERE/capture_calib.py" "$HF" "$WORK/calib_runs.tmp" --threads "$THREADS"
++    rm -rf "$WORK/calib_runs" && mv "$WORK/calib_runs.tmp" "$WORK/calib_runs"
++}
++
++# resumable internally: finished trajectories are kept
++s_trajectories() { py "$HERE/gen_trajectories.py" "$HF" "$WORK/trajectories" --threads "$THREADS"; }
++
++s_calib_tf() {
++    rm -rf "$WORK/calib_all.tmp"
++    py "$HERE/capture_tf.py" "$HF" "$WORK/trajectories" "$WORK/calib_runs" "$WORK/calib_all.tmp" --threads "$THREADS"
++    rm -rf "$WORK/calib_all" && mv "$WORK/calib_all.tmp" "$WORK/calib_all"
++}
++
++s_talker() {
++    rm -rf "$WORK/talker" "$OUT/Qwen3-1.7B-NPU2"
++    py "$HERE/quantize_talker.py" "$HF" "$WORK/calib_all" "$WORK/talker/Qwen3-1.7B-NPU2" --threads "$THREADS"
++    mv "$WORK/talker/Qwen3-1.7B-NPU2" "$OUT/" && rmdir "$WORK/talker"
++}
++
++s_package_json() {
++    local sha rev=()
++    sha="$(cat "$WORK/model.sha256")"
++    [ "$sha" = "$KNOWN_SHA256" ] && rev=(--revision "$KNOWN_REVISION")
++    py "$HERE/write_package_json.py" "$HF" "$OUT" --repo "$REPO" "${rev[@]}" --sha256 "$sha"
++}
++
++step checkpoint s_checkpoint
++step config s_config
++step tokenizer s_tokenizer
++step host s_host
++step speech_tokenizer s_speech_tokenizer
++step predictor s_predictor
++step calib_runs s_calib_runs
++step trajectories s_trajectories
++step calib_tf s_calib_tf
++step talker s_talker
++step package_json s_package_json
++
++echo "== package $OUT"
++(cd "$OUT" && find . -type f ! -name '*.tmp' | sort | xargs sha256sum)
+diff --git a/src/tools/qwen3_tts/calib_entropy_texts.json b/src/tools/qwen3_tts/calib_entropy_texts.json
+new file mode 100644
+index 00000000..90abd3f6
+--- /dev/null
++++ b/src/tools/qwen3_tts/calib_entropy_texts.json
+@@ -0,0 +1,130 @@
++[
++ {
++  "id": "base00",
++  "text": "京都には素晴らしい観光地がたくさんありますが、特に初めて訪れる方には清水寺をおすすめします。本堂から眺める景色は息をのむほど美しく、特に春の桜や秋の紅葉の季節は格別です。 また、金閣寺も有名ですね。金色に輝く舎利殿が鏡湖池に映る姿は、まさに京都の象徴とも言える風景です。 静かに歴史を感じたい方には、伏見稲荷大社もおすすめです。千本鳥居が山頂まで続いている光景は、どこか神秘的で、歩いているだけで心が洗われるような気持ちになります。 もし時間が許すなら、嵐山もぜひ訪れてみてください。竹林の道や渡月橋からの眺めは、都会の喧騒を忘れさせてくれる穏やかな時間が流れています。 どの季節に訪れるかによって景色が変わりますので、自分の好きな雰囲気に合わせて選んでみると楽しいですよ。"
++ },
++ {
++  "id": "base01",
++  "text": "今日のおすすめは、卵とネギを炒めるだけの超簡単メニュー、オムレツ風チャーハンです。まず、卵を二つボウルに割って、よくかき混ぜておいてください。次に、フライパンに油を熱して、刻んだ長ねぎを軽く炒めます。そこに温かいご飯を加えて、パラパラになるまでほぐしながら炒めましょう。ご飯が温まったら、火を弱めて、先ほど混ぜておいた卵液を回し入れます。卵が半熟の状態で火を止めて、全体をさっくりと混ぜ合わせれば完成です。塩コショウで味を整えるだけで、栄養バランスも良くて、洗い物も少なくて済みますよ。"
++ },
++ {
++  "id": "base02",
++  "text": "雨の日は、少し気分を切り替えて、家の中でゆっくりと過ごしてみるのはどうでしょうか。 まずは、温かい飲み物を用意して、お気に入りの本を読む時間を作ってみてください。雨音をBGMにしながら読書をするのは、とてもリラックスできるひとときです。 もし体を動かしたい気分なら、軽いストレッチやヨガを取り入れるのもおすすめです。雨で外出できないストレスを、体を伸ばすことで解消できますよ。 また、普段は忙しくて後回しにしている整理整頓や、好きな映画やドラマを一気見するのも楽しいですね。窓の外を眺めながら、自分のペースで静かな時間を楽しむのが、雨の日の素敵な過ごし方だと思います。"
++ },
++ {
++  "id": "base03",
++  "text": "初めてのキャンプで特に気をつけていただきたいのは、まずは現地での移動や準備がスムーズにいくかどうかです。慣れない環境では、テントの設営や食事の準備に予想以上時間がかかることがよくあります。そのため、到着は余裕を持って夕方前までに済ませることをおすすめします。暗くなると視界が悪くなり、作業効率が下がるだけでなく、虫や野生動物への警戒も必要になるからです。 また、天候の変化にも十分注意してください。山間部や川沿いでは、平地よりも急に天気が変わりやすいです。雨具や防寒着は、天気予報が晴れでも必ず持っていくようにしましょう。夜間は思っているより冷えることが多いので、夏場でも羽織るものがあると安心です。 火の扱いも重要なポイントです。焚き火をする場合は、必ずそのキャンプ場が焚き火を許可しているか確認してください。許可されていても、火を消し忘れることがないよう、寝る前には完全に消火し、灰が冷えているか触って確認する習慣をつけてください。 最後に、ゴミの持ち帰りや騒音への配慮も忘れずに行いましょう。自然の中で楽しく過ごすためにも、他のキャンパーさんや環境への思いやりを大切にしてください。最初は失敗も経験のうちですので、無理をせず、安全第一で楽しんでくださいね。"
++ },
++ {
++  "id": "base04",
++  "text": "日本には春、夏、秋、冬という四つの季節があり、それぞれの季節が異なる美しさや風情をもたらしています。春には桜が満開になり、人々は公園や寺社で花見を楽しみながら、新しい生活の始まりを祝います。夏になると気温が上がり、海や山でのレジャーが盛んになりますが、同時に七夕や花火大会など、伝統的な行事も数多く行われます。秋は実りの季節として知られ、色とりどりに紅葉した山々を眺めたり、収穫された食材を味わったりする楽しみがあります。そして冬は、地域によっては雪に覆われ、温泉で温まったり、静かな雪景色を眺めたりと、落ち着いた時間を過ごすのに最適な季節です。このように、日本の四季は自然の移ろいを感じさせるとともに、人々の暮らしや文化に深く根ざしています。"
++ },
++ {
++  "id": "base05",
++  "text": "朝型の生活に変えるコツとして、まずは夜の就寝時間を少しずつ早めることが大切です。突然大きく変えるのは体への負担が大きいので、毎日十五分ずつ寝る時間を早めるなどして、無理なくリズムを作っていくのがおすすめです。 また、朝起きたらまずカーテンを開けて、太陽の光をしっかりと浴びましょう。光を浴びることで体内時計がリセットされ、夜に自然と眠くなるサイクルが整いやすくなります。 さらに、夜寝る前にはスマホやパソコンなどの強い光を見る時間を減らし、読書やストレッチなどリラックスできる時間を持つと、質の良い睡眠につながります。 朝活そのものを楽しむことも大切なポイントです。好きなコーヒーを淹れる時間や、静かな環境での散歩など、朝ならではの心地よい時間を設けることで、早起きへのモチベーションが高まります。焦らずに少しずつ習慣化していくことが、長続きする秘訣ですよ。"
++ },
++ {
++  "id": "base06",
++  "text": "最近読んだ中で特におすすめしたい本を何冊かご紹介しますね。 まず一冊目は、岸見一郎さんと古賀史健さんによる「嫌われる勇気」です。アドラー心理学を対話形式で分かりやすく解説した本で、人間関係の悩みや自分自身のあり方について、目からうろこの考え方がたくさん詰まっています。読み終わると、心がすっと軽くなるような感覚を得られるかもしれません。 次に、東野圭吾さんの「白夜行」はいかがでしょうか。長編ミステリー小説ですが、ただ事件の真相を追うだけでなく、登場人物たちの切なくも美しい人生の物語として深く心に残ります。サスペンスと人間ドラマのバランスが絶妙で、一気に読み進めてしまうこと間違いなしです。 もし、もっと気軽に読めるものがよければ、佐野洋子さんの「100万回生きたねこ」もおすすめです。絵本ですが、大人が読んでも涙が出るほど深いメッセージが込められています。短時間で読めますが、その余韻は長く心に残る一冊です。 あなたは今、どのような気分ですか。もし、もっと具体的なジャンルや、今の気分に合った本があれば、ぜひ教えてくださいね。"
++ },
++ {
++  "id": "base07",
++  "text": "どちらが飼いやすいかは、あなたの生活スタイルによって大きく変わりますよ。もし仕事が忙しかったり、あまり外に出ない方なら猫の方が向いているかもしれません。猫は基本的に一人で留守番ができるし、散歩も必要ないので、時間的な負担が少ないです。 一方で、犬は毎日のお散歩が必要ですし、しつけや社会化のために時間と根気が必要になります。でも、その分だけ一緒に体を動かしたり、外の世界と触れ合えたりする楽しさがありますよ。 結局のところ、自分の生活リズムに合っているかどうかと、どちらの動物の性格に魅力を感じるかが一番のポイントですね。"
++ },
++ {
++  "id": "base08",
++  "text": "在宅勤務で集中力を高めるためには、まず仕事とプライベートの境界線を明確にすることが大切です。具体的なコツとしては、朝の準備に時間を使って、家の中でも「ここは仕事をする場所」と決めた専用スペースで作業に臨むことが効果的です。また、作業中はスマホを別の部屋に置くなどして、物理的に誘惑を遠ざけましょう。さらに、集中できる時間と休憩の時間を交互に取るポモドーロテクニックを取り入れると、脳が疲れにくくなり、長い時間でも質の高い仕事ができるようになります。最後に、一日の終わりにはワークアウトや散歩などをして、仕事モードから完全に切り替える習慣をつけることで、翌日の集中力も保たれます。"
++ },
++ {
++  "id": "base09",
++  "text": "週末に東京で遊ぶなら、まず浅草に行って仲見世通りを歩き、雷門の前で記念写真を撮るのがおすすめです。その後、東京スカイツリーに上がって街全体を見渡すのも気分が上がります。もし自然を楽しみたいなら、上野公園でパンダを見たり、お花見やピクニックをしたりするのがいいですね。また、新宿や渋谷でショッピングやグルメを楽しむのも定番です。特に新宿では歌舞伎町や思い出横丁で美味しい料理を食べながら、夜の街の活気を味わえます。さらに、お台場に行けば海沿いのレインボーブリッジを眺めながら散歩ができ、子供連れならチームラボボーダレスなどのデジタルアート展で非日常を体験するのも素晴らしい思い出になります。あなたの好みや天気によってプランを変えてみてください。"
++ },
++ {
++  "id": "base10",
++  "text": "健康的な朝食としておすすめなのは、まずタンパク質と食物繊維をバランスよく摂ることです。例えば、卵料理と全粒粉のパン、それにヨーグルトや果物を組み合わせるのがいいでしょう。卵は焼いたりゆで卵にしたりして手軽に食べられますし、全粒粉のパンなら腹持ちもよく、血糖値の急上昇も抑えられます。また、ヨーグルトには善玉菌が含まれているので腸内環境を整えるのにも役立ちます。時間がない場合は、バナナとナッツ類、それにプロテインドリンクなども手軽で栄養満点な選択肢ですよ。大切なのは、無理なく続けられることなので、自分の好きな食材を取り入れながら、ゆっくり噛んで食べることを心がけてみてください。"
++ },
++ {
++  "id": "base11",
++  "text": "子どもと室内で楽しめるゲームですね。まずは、体を動かさずにできるものから考えてみましょう。 例えば、しりとりやなぞなぞは道具もいらず、いつでもどこでも楽しめます。また、カードやトランプを使った神経衰弱やババ抜きなども、集中力を養いながら盛り上がれます。 少し体を動かしたい場合は、室内でできる宝探しゲームがおすすめです。家の中に隠した物を探してもらう簡単なゲームで、子どもたちは夢中になります。 さらに、新聞紙をちぎって雪合戦のように遊んだり、風船を割らないようにパスし合ったりする遊びも、安全で楽しいですよ。 子どもの年齢や興味に合わせて、ぜひいくつか試してみてくださいね。"
++ },
++ {
++  "id": "base12",
++  "text": "旅行の荷造りのコツとしてまずおすすめしたいのは、服を丸めてたたむロール方式です。こうすることでシワになりにくく、また行李箱の隙間を上手に活用できるため、スペースを大きく節約できます。 次に、パッキングキューブを使うと、衣類や下着、アクセサリーなどを種類別に整理でき、荷物の中から必要なものを探しやすくなります。また、靴はヒール部分に靴下を詰め込んで型崩れを防ぎ、靴底を外側に向けて袋に入れ、他の荷物と分けておくと衛生的です。 さらに、重い荷物は行李箱の下に、軽いものは上に配置すると、移動時に安定しやすくなります。最後に、帰りに買うお土産用のスペースを最初から確保しておくと、帰り道に荷物が増えたときも慌てずに済みますよ。"
++ },
++ {
++  "id": "base13",
++  "text": "寝つきを良くするためには、まず就寝前の時間をリラックスできる環境に整えることが大切です。寝る一時間前からはスマホやパソコンの光を避けて、部屋を少し暗くすると脳が休息モードに入りやすくなります。また、ぬるめのお風呂にゆっくり浸かるのも効果的です。体温が上がった後に自然に下がっていく過程で、眠気が誘われます。 さらに、日中の過ごし方も見直してみましょう。朝起きたら太陽の光を浴びて体内時計をリセットし、適度な運動を習慣づけることが夜の良い睡眠につながります。逆に、夕方以降のカフェインや激しい運動、アルコールは避けるように心がけてください。 最後に、布団に入ってもなかなか眠れない場合は、無理に眠ろうとせず、一度布団から出て軽い読書などをして、再び眠気が来たタイミングで横になるという方法も試してみてください。このように、心と体をゆっくり休める準備を丁寧に行うことが、スムーズな入眠への近道ですよ。"
++ },
++ {
++  "id": "base14",
++  "text": "初心者におすすめの趣味として、まずは歩くことを楽しむウォーキングはいかがでしょうか。特別な道具を揃えなくても始められて、体への負担も少ないので、気軽に続けやすいのが魅力です。また、家の中で手軽に楽しめる読書もおすすめです。興味のある分野の本から手を出してみれば、知識が深まるだけでなく、リラックス効果も期待できます。さらに、料理も生活に直結する楽しい趣味の一つです。簡単なレシピから挑戦することで、達成感が得られやすく、食費の節約にもつながります。大切なのは、完璧を目指さず、自分が心地よいと感じるペースで楽しむことです。まずは気になるものを一つ試してみて、合うかどうかを確かめてみてください。"
++ },
++ {
++  "id": "base15",
++  "text": "日本のお祭りは、その土地の歴史や文化、そして地域の人々のつながりを深く感じられる、とても魅力的な伝統行事です。 まず、お祭りの起源は、多くの場合、自然への感謝や、災いを追い払う願い、あるいは神様への敬意から始まっています。そのため、神社や寺院と深く結びついているものがほとんどです。春には豊作を祈る祭り、夏には疫病除けや盆の行事、秋には収穫を祝う祭り、そして冬には新年の準備や無病息災を願う祭りなど、一年を通じて季節ごとに多彩な催しが各地で行われます。 お祭りの楽しみ方は、見どころによって様々です。例えば、京都の祇園祭や秋田の竿灯まつりのような、巨大で華やかな山車や神輿が街を練り歩く姿は圧巻です。また、徳島の阿波踊りや高知のよさこい祭りのように、多くの人が揃いの衣装を身に着けて踊り、一体感を楽しむ祭りもあります。さらに、地元の屋台で焼きそばやたこ焼きなどの屋台グルメを味わいながら歩くのも、お祭りの定番の楽しみ方ですね。 近年では、伝統を守りつつも、観光資源として海外からも注目を集めており、多くの人々が訪れています。もし機会があれば、実際にお祭りの現場で、太鼓の音"
++ },
++ {
++  "id": "base16",
++  "text": "節約のコツですね。一番大切なのは、まず自分のお金の流れを知ることです。家計簿をつけるのが苦手なら、レシートを撮影するだけや、銀行の明細を週に一度確認するだけでも、どこにお金を使っているかが見えてきます。 次に、固定費を見直してみてください。スマホのプランや保険、サブスクリプションのサービスなどは、一度見直すだけで毎月大きく金額が変わることがあります。特にスマホは乗り換えるだけで数千円浮くことが多いです。 また、食費では食材の使い切りを意識すると良いです。買い出しに行く前に冷蔵庫の中身をチェックして、献立を決めてから行くようにすると、無駄な買い物が減ります。外食を減らすのも効果的ですが、無理に我慢しすぎると続かないので、週に一回は好きなものを食べる日を作るなど、メリハリをつけることが長続きする秘訣です。 最後に、貯金は残った分を貯めるのではなく、収入が入ったら先に貯金額を別の口座へ移してしまう先取り貯金を習慣化するのがおすすめです。小さなことから始めて、無理なく続けられる方法を見つけてみてください。"
++ },
++ {
++  "id": "base17",
++  "text": "春に行くなら、やはり桜がきれいな場所がおすすめです。たとえば京都の哲学の道は、川沿いに桜並木が続いていて、歩いているだけで心が穏やかになります。また、東京の上野公園も定番ですが、春の空気を感じながらお花見を楽しむのはとても気持ちが良いですよ。もしもう少し静かに楽しみたいなら、秩父の羊山公園では、一面に咲き誇る芝桜のピンクの絨毯を見ることができます。あなたの好みに合わせて、のんびり歩くのか、それとも美しい花々に囲まれるのか、ぜひ考えてみてください。"
++ },
++ {
++  "id": "base18",
++  "text": "英語の勉強を続けるためのコツとして、まず大切なのは完璧を目指さないことです。毎日完璧にこなそうとすると、疲れて挫折しやすくなりますから、一日たったの五分でも良いので、英語に触れる習慣をつけることが重要ですね。 また、自分の好きな映画や音楽、ゲームなどを通じて英語を学ぶと、楽しみながら続けやすくなります。興味のあることなら、無理なく続けられるからです。 さらに、小さな目標を立てて、それを達成した自分を褒めてあげることも効果的です。例えば、今日は新しい単語を三つ覚えた、という小さな成功体験を積み重ねることで、やる気が維持しやすくなりますよ。 最後に、一人で頑張るよりも、勉強仲間を作ったり、SNSで進捗を報告したりして、外からの刺激を受けるのも良い方法です。焦らず、マイペースに楽しむことを最優先にしてくださいね。"
++ },
++ {
++  "id": "base19",
++  "text": "おいしいコーヒーを淹れるコツは、まず新鮮な豆を用意することから始まります。焙煎してから二週間以内に使い切るように心がけてください。次に大事なのは、淹れる直前に豆を挽くことです。粉の粗さは中挽きがおすすめです。 お湯の温度も重要で、沸騰したお湯を少し冷まして、八十五度から九十度くらいに調整してください。熱すぎるお湯だと苦味や雑味が出てしまいます。 ドリッパーにフィルターをセットし、粉を均一にならします。最初にお湯を少量注いで、粉全体を湿らせて三十秒ほど待ちます。これを蒸らしと呼び、コーヒーの風味を引き出す大切な工程です。 その後、中心から外側へ、のの字を描くようにゆっくりと注ぎます。お湯を粉の壁に直接かけないよう注意してください。全体の抽出時間は二分から三分程度を目安にすると、バランスの良い味になります。 最後に、淹れ立てのコーヒーを温めたカップに注いで、香りごと味わってください。"
++ },
++ {
++  "id": "base20",
++  "text": "ストレス解消法ですね。まずは深呼吸をゆっくりと繰り返して、体の緊張をほぐすところから始めてみてください。それと、好きな音楽を聴いたり、短い散歩に出かけたりするのも効果的です。もし余裕があれば、好きな趣味に没頭したり、信頼できる人と世間話をしたりするのも心が軽くなりますよ。ご自身のペースで、無理なくできることから試してみてくださいね。"
++ },
++ {
++  "id": "base21",
++  "text": "夏バテを防ぐためには、まず水分とミネラルをこまめに補給することが大切です。一度に大量に飲むのではなく、喉が渇いていなくても少しずつ頻繁に水分を摂りましょう。汗と一緒に失われる塩分やカリウムなどのミネラルも一緒に摂ることをおすすめします。 また、食事はバランスよく、消化に良いものを心がけてください。冷たいものばかりでなく、温かいスープや生姜などを使った料理も取り入れると、内臓を冷やしすぎず、血流を良くする効果が期待できます。 十分な睡眠と休息も非常に重要です。暑さで疲れやすい時期ですが、エアコンで室温を適切に調整し、質の良い睡眠を確保するようにしましょう。無理をせず、体調の変化に早めに気づいて休むことが、夏を元気に乗り切る秘訣です。"
++ },
++ {
++  "id": "base22",
++  "text": "部屋を片付ける一番のコツは、完璧を目指さずにまず小さく始めることです。いきなり全部をやろうとすると気が重くなって手が止まってしまうので、今日は机の上だけとか、引き出しの一段だけといったように、目に見えて効果がわかりやすい小さな範囲に集中してみてください。 また、片付けるときは物を決まった場所にしまうだけでなく、いらないものを手放す判断をすることがとても大切です。一年使っていないものや、なんとなく捨てられずに置いてあるものは、思い切って手放すか、別で箱にまとめて一旦外に出しておくと、部屋が一気にすっきりします。 さらに、使ったものをその場に戻す習慣をつけることも大事です。例えば、服を脱いだらすぐクローゼットへ、本を読んだらすぐ棚へというように、元の場所に戻す動作を徹底すると、散らかりにくくなります。 最後に、片付けは毎日少しずつ行うことが長続きの秘訣です。一日に十五分だけ時間を決めて行うなど、無理のないペースで続けることで、きれいな状態を自然と保てるようになりますよ。"
++ },
++ {
++  "id": "base23",
++  "text": "プレゼント選びってワクワクしますよね。まずはそのお友だちが普段どんなことに興味があるか、それから二人の関係性や予算感を思い浮かべながら考えてみると良いと思います。 もし相手がカフェ巡りが好きなら、最近話題のスペシャルティコーヒーの豆セットや、おしゃれなマグカップなんかが喜ばれそうですし、料理好きの方なら、ちょっと高級なオリーブオイルや、見た目がかわいい調味料のセットなんかも喜ばれることが多いです。 また、相手の名前が入った刻印入りのキーホルダーや名刺入れといったパーソナライズされたグッズも、特別感が出ておすすめです。もし何を好んでいるか分からない場合は、消費してもなくならないギフト券や、自分では買わないけれど使ってみると楽しいような、ちょっと贅沢なお取り寄せスイーツなんかも失敗しにくいですよ。 大切なのは、相手のことを考えながら選んだという気持ちが伝わることなので、一緒に選んだ時間を大切にしてあげてくださいね。"
++ },
++ {
++  "id": "long0",
++  "text": "最近読んだ中で特に心に残った本として、小川糸さんの「ツバキ文具店」はいかがでしょうか。鎌倉の文具店を舞台に、代筆屋として暮らす主人公が、人々の手紙に寄り添いながら自分自身の過去と向き合っていく物語です。文章が美しく、登場人物たちの優しさが温かく伝わってくるので、疲れた心にそっと寄り添ってくれるような一冊になっています。もしもう少し軽くて面白いものがよければ、伊坂幸太郎さんの「アヒルと鴨のコインロッカー」もおすすめです。不思議な仕掛けとユーモアが詰まっていて、読み終わった後に幸せな気持ちになれますよ。"
++ },
++ {
++  "id": "long1",
++  "text": "日本の四季は、春、夏、秋、冬という明確な季節の移ろいが楽しめることで世界中から愛されています。春には桜が咲き誇り、人々が花見を楽しみながら新しい始まりの季節を祝います。夏は緑が深く生い茂り、祭りが開催されたり、海や山でレジャーを楽しんだりする活気あふれる季節です。秋になると木々が色づき、紅葉が美しい景色を作り出し、収穫の喜びを感じながら静かな美しさを味わいます。そして冬は雪が降り積もり、澄み切った空気の中で温泉に浸かったり、雪景色を眺めたりして、心静かに過ごすことができます。このように、それぞれの季節が独自の魅力と風情を持っており、自然の変化を敏感に感じ取る文化が根付いているのが日本の四季の特徴です。"
++ },
++ {
++  "id": "long2",
++  "text": "正直に言うと、飼いやすさの定義によって答えが変わると思います。もし忙しい方や一人暮らしの方が、自分のペースでペットと過ごしたいなら、猫の方が飼いやすいことが多いです。猫は基本的に室内だけで生活でき、散歩の必要がないので、雨の日でも外に出る手間がありません。また、トイレも自分で覚えることが多く、自立心が強いため、日中お留守番をさせても比較的安心です。 一方で、犬は散歩が必要ですし、しつけや社会化に時間をかける必要があります。ただ、犬は飼い主に忠実で、一緒にアウトドアを楽しんだり、コミュニケーションを深く取りたい人には向いています。 つまり、時間の自由度を重視するなら猫、パートナーとして一緒に活動したいなら犬、というように、あなたの生活スタイルに合う方が飼いやすいと感じるはずです。"
++ },
++ {
++  "id": "long3",
++  "text": "日本の四季は、それぞれに独特の美しさと情趣が満ち溢れています。春には桜が美しく咲き誇り、人々がその花見を楽しみながら、新しい始まりの季節を実感します。夏は緑が深まり、蝉の声が響き渡り、各地で華やかな祭りが行われ、夜には花火が夜空を彩ります。秋になると、木々の葉が赤や黄色に色づき、収穫の喜びとともに、静かで穏やかな雰囲気の中で自然の豊かさを感じ取ることができます。そして冬は、雪が降り積もり、白銀の世界が広がり、温泉に浸かりながら、静寂の中で心身を癒やすことができます。このように、日本では季節の移ろいとともに、自然の表情や人々の暮らし、そして食文化までもが豊かに変化していくのが大きな魅力です。"
++ },
++ {
++  "id": "long4",
++  "text": "朝型の生活に変えるには、まず夜の睡眠環境を整えることが何より大切です。寝る前の一時間ほどはスマホやパソコンの画面を見るのをやめて、部屋を暗くしてリラックスした時間を過ごしてみてください。そうすることで自然と眠気が訪れやすくなります。 また、朝起きたらすぐにカーテンを開けて太陽の光を浴びる習慣をつけてみてください。光を浴びることで体内時計がリセットされ、夜に眠くなるリズムが整いやすくなります。最初のうちは起きるのがつらいかもしれませんが、無理に早起きしようとするのではなく、まずはいつもより十五分だけ早く起きるなど、小さな目標から始めるのが成功のコツです。 さらに、朝のルーティンを決めておくとスムーズに動けます。例えば、起きてから水を一杯飲む、軽いストレッチをする、など簡単な動作をセットにしておくと、頭がぼんやりしている状態でも体が自然と動いてくれます。このように夜のリズムと朝の行動を両方から整えることで、無理なく朝型の生活へと移行できるはずです。"
++ },
++ {
++  "id": "long5",
++  "text": "初めてのキャンプで気をつけることとして、まず最初に大切なのは無理をしないことです。テントの設営や火起こしは、慣れないと時間がかかったり、失敗したりしやすいので、余裕を持って早めに準備を始めるのが安心です。 また、天気予報を何度も確認して、雨や強風への対策を万全にしておくことが非常に重要です。雨具やタープを忘れずに持っていきましょう。 夜間は想像以上に冷えることもありますので、季節を問わず暖かい服装や寝具を準備しておくと快適に過ごせます。 そして、ゴミはすべて持ち帰るというマナーを守ることや、火の扱いには十分に注意して、消し残しがないか必ず確認してください。 最後に、初めてのキャンプは準備に追われがちですが、自然の中でゆっくりとした時間を過ごすことを目的に、肩の力を抜いて楽しむことが一番のコツです。"
++ },
++ {
++  "id": "long6",
++  "text": "雨の日は、少しだけ気分を切り替えて、自分だけの特別な時間を過ごしてみませんか。まずは、温かい飲み物を用意して、窓の外に降りしきる雨の音を眺めながら、いつもよりゆっくりと読書を楽しむのがおすすめです。普段は忙しくて読めない本や、積ん読になっている本に手を伸ばすと、不思議と心が落ち着きます。 もし体を動かしたければ、室内でできるストレッチやヨガを取り入れてみるのもいいですね。雨音は自然なホワイトノイズになるので、瞑想やマインドフルネスにも最適です。また、久しぶりに会っていない友人や家族と、電話やビデオ通話で長々と話をするのも、雨の日の素敵な過ごし方です。 さらに、キッチンに立って、手間暇かかる煮込み料理やスイーツ作りに挑戦するのも楽しいでしょう。部屋全体に漂う香りが、雨の憂鬱さを吹き飛ばしてくれます。無理に外に出る必要はないので、この機会に心と体をしっかりと休めて、英気を養ってください。"
++ },
++ {
++  "id": "long7",
++  "text": "雨の日には、ぜひご自身の心と体をゆったりと休める時間として活用してみてください。まずおすすめなのは、温かい飲み物を片手に、読書や映画鑑賞に浸ることです。窓の外に落ちる雨の音をBGMにしながら、普段は忙しくて読む時間がない本を開いたり、気になっていた長編映画をじっくり見たりすると、心がすっと穏やかになります。 また、少し体を動かしたい場合には、室内での軽いストレッチやヨガも良い気分転換になります。雨で外に出られないストレスを、深い呼吸とともにほぐしていくイメージでやってみると、すっきりとした気持ちになれるはずです。 もし誰かと一緒に過ごせる環境であれば、簡単な料理を一緒に作ったり、昔の写真を見返しながら思い出話に花を咲かせたりするのも楽しいですよ。雨の日ならではの、静かで落ち着いた雰囲気を味わいながら、ご自身が心地よいと感じる方法を選んでみてください。"
++ }
++]
+\ No newline at end of file
+diff --git a/src/tools/qwen3_tts/calib_runs.json b/src/tools/qwen3_tts/calib_runs.json
+new file mode 100644
+index 00000000..13c973ae
+--- /dev/null
++++ b/src/tools/qwen3_tts/calib_runs.json
+@@ -0,0 +1,30 @@
++[
++  ["おはようございます。今日も一日、よろしくお願いします。", "ono_anna", "Japanese"],
++  ["え、ちょっと待って。それ、本当に私が言ったの？", "ono_anna", "Japanese"],
++  ["やったー！ついに完成したよ、見て見て！", "ono_anna", "Japanese"],
++  ["申し訳ございません。ただいま担当者が席を外しております。", "ono_anna", "Japanese"],
++  ["昨日の夜、窓の外で猫が二匹、ずっと鳴いていたんです。", "ono_anna", "Japanese"],
++  ["あなたがいてくれたから、ここまで来られたんだと思う。", "ono_anna", "Japanese"],
++  ["次の電車は、十時四十五分発、各駅停車の新宿行きです。", "ono_anna", "Japanese"],
++  ["ふざけないでよ！何回同じことを言わせるつもり？", "ono_anna", "Japanese"],
++  ["この料理、見た目は地味だけど、味は本当に最高なんだ。", "ono_anna", "Japanese"],
++  ["さて、ここで問題です。日本で一番高い山はどこでしょう？", "ono_anna", "Japanese"],
++  ["春になると、川沿いの桜並木がピンク色に染まって、とてもきれいです。", "ono_anna", "Japanese"],
++  ["平成三十一年四月三十日、およそ三十年続いた時代が幕を閉じました。", "ono_anna", "Japanese"],
++  ["ごめんね、今日はちょっと疲れちゃったから、先に寝るね。", "ono_anna", "Japanese"],
++  ["うわあ、すごい雨！傘、持ってきてよかった。", "ono_anna", "Japanese"],
++  ["会議の資料は、共有フォルダの第三四半期報告書に入っています。", "ono_anna", "Japanese"],
++  ["ねえ、覚えてる？初めて会った日も、こんなふうに晴れてたよね。", "ono_anna", "Japanese"],
++  ["本日の最高気温は三十五度、熱中症に十分注意してください。", "ono_anna", "Japanese"],
++  ["むかしむかし、ある山奥の小さな村に、おじいさんとおばあさんが住んでいました。", "ono_anna", "Japanese"],
++  ["嘘でしょ……そんなの、信じられない。", "ono_anna", "Japanese"],
++  ["はい、かしこまりました。少々お待ちくださいませ。", "ono_anna", "Japanese"],
++  ["量子コンピューターの研究は、ここ数年で急速に進展しています。", "ono_anna", "Japanese"],
++  ["もしもし、聞こえますか？電波が悪いみたいで、声が途切れるんです。", "ono_anna", "Japanese"],
++  ["がんばれ！あと少しでゴールだよ！", "ono_anna", "Japanese"],
++  ["静かな図書館で、ページをめくる音だけが響いていた。", "ono_anna", "Japanese"],
++  ["Good morning! Did you sleep well? I made some coffee for you.", "ryan", "English"],
++  ["Wait, what? You're telling me the meeting was moved to Friday?", "ryan", "English"],
++  ["The quarterly revenue grew by twelve point five percent compared to last year.", "ryan", "English"],
++  ["Honestly, I never thought we would make it this far. Thank you.", "ryan", "English"]
++]
+diff --git a/src/tools/qwen3_tts/calib_trajectories.json b/src/tools/qwen3_tts/calib_trajectories.json
+new file mode 100644
+index 00000000..0b3795ff
+--- /dev/null
++++ b/src/tools/qwen3_tts/calib_trajectories.json
+@@ -0,0 +1,52 @@
++[
++  ["c01", "いらっしゃいませ。本日はどのようなご用件でしょうか。", "ono_anna", "Japanese"],
++  ["c02", "ちょっと、聞いてる？さっきから同じこと三回も言ってるんだけど。", "ono_anna", "Japanese"],
++  ["c03", "わあ、きれい！こんなに星が見えるなんて思わなかった。", "ono_anna", "Japanese"],
++  ["c04", "大丈夫、心配しないで。私がちゃんと見ておくから。", "ono_anna", "Japanese"],
++  ["c05", "先月の売上は、前年同月比で八・五パーセント増加しました。", "ono_anna", "Japanese"],
++  ["c06", "なんで黙ってたの？言ってくれれば、手伝えたのに。", "ono_anna", "Japanese"],
++  ["c07", "こちらのお部屋は、窓から海が一望できる人気のお部屋です。", "ono_anna", "Japanese"],
++  ["c08", "うそ、もうこんな時間？急がないと終電に間に合わない！", "ono_anna", "Japanese"],
++  ["c09", "人工知能の発展により、私たちの働き方は大きく変わりつつあります。", "ono_anna", "Japanese"],
++  ["c10", "ありがとう。その言葉だけで、十分うれしいよ。", "ono_anna", "Japanese"],
++  ["c11", "第一章、旅のはじまり。少年は、古い地図を手に家を出た。", "ono_anna", "Japanese"],
++  ["c12", "えっと、たぶん左の道だと思うけど、自信はないかな。", "ono_anna", "Japanese"],
++  ["c13", "お客様にお知らせいたします。まもなく三番線に快速電車がまいります。", "ono_anna", "Japanese"],
++  ["c14", "もう知らない！勝手にすればいいじゃない。", "ono_anna", "Japanese"],
++  ["c15", "その件につきましては、改めてご連絡させていただきます。", "ono_anna", "Japanese"],
++  ["c16", "見て、あの雲、くじらみたいな形してない？", "ono_anna", "Japanese"],
++  ["c17", "二〇二四年の調査では、回答者の約七割が満足と答えました。", "ono_anna", "Japanese"],
++  ["c18", "寒いね。温かいスープでも飲みに行こうか。", "ono_anna", "Japanese"],
++  ["c19", "本当にごめんなさい。二度とこんなことはしません。", "ono_anna", "Japanese"],
++  ["c20", "やばい、めっちゃおいしい！これ、どこで買ったの？", "ono_anna", "Japanese"],
++  ["c21", "夕暮れの商店街には、焼き鳥の香ばしいにおいが漂っていた。", "ono_anna", "Japanese"],
++  ["c22", "では、本日の議題に入ります。まず、予算案についてです。", "ono_anna", "Japanese"],
++  ["c23", "ねえ、今度の日曜日、空いてる？映画でも見に行かない？", "ono_anna", "Japanese"],
++  ["c24", "警告。この先、落石の危険があります。注意して進んでください。", "ono_anna", "Japanese"],
++  ["c25", "おめでとうございます！見事、一等賞に当選されました！", "ono_anna", "Japanese"],
++  ["c26", "彼女は何も言わずに、ただ静かに微笑んでいた。", "ono_anna", "Japanese"],
++  ["c27", "この薬は一日三回、食後に二錠ずつ服用してください。", "ono_anna", "Japanese"],
++  ["c28", "えー、また雨？せっかくの休みなのに、ついてないなあ。", "ono_anna", "Japanese"],
++  ["c29", "東京から大阪までは、新幹線でおよそ二時間三十分です。", "ono_anna", "Japanese"],
++  ["c30", "大好きだよ。これからも、ずっと一緒にいようね。", "ono_anna", "Japanese"],
++  ["c31", "システムの再起動が完了しました。引き続きご利用いただけます。", "ono_anna", "Japanese"],
++  ["c32", "ああ、もう！なんでいつもこうなるの？", "ono_anna", "Japanese"],
++  ["c33", "古い寺の境内では、苔むした石灯籠が静かに並んでいる。", "ono_anna", "Japanese"],
++  ["c34", "質問はありますか？なければ、次のスライドに進みます。", "ono_anna", "Japanese"],
++  ["c35", "ふふっ、くすぐったいよ。やめてってば。", "ono_anna", "Japanese"],
++  ["c36", "株価は午前中に一時、三百円以上値下がりしました。", "ono_anna", "Japanese"],
++  ["c37", "がっかりしないで。次はきっとうまくいくよ。", "ono_anna", "Japanese"],
++  ["c38", "ご注文を繰り返します。ハンバーガーがお二つと、コーヒーがお一つですね。", "ono_anna", "Japanese"],
++  ["c39", "ええっ、あの二人、付き合ってたの？全然気づかなかった！", "ono_anna", "Japanese"],
++  ["c40", "朝の光が差し込む台所で、母は黙々と味噌汁を作っていた。", "ono_anna", "Japanese"],
++  ["c41", "Oh no, I completely forgot about the deadline. What do we do now?", "ryan", "English"],
++  ["c42", "Ladies and gentlemen, please fasten your seatbelts and prepare for landing.", "ryan", "English"],
++  ["c43", "That was incredible! I can't believe you actually pulled it off!", "ryan", "English"],
++  ["c44", "The museum opens at nine thirty and closes at five in the evening.", "ryan", "English"],
++  ["c45", "Look, I'm sorry. I didn't mean to hurt you, I really didn't.", "ryan", "English"],
++  ["c46", "Could you tell me where the nearest train station is, please?", "ryan", "English"],
++  ["c47", "In twenty twenty three, global temperatures reached a record high.", "ryan", "English"],
++  ["c48", "Shh, keep your voice down. The baby just fell asleep.", "ryan", "English"],
++  ["c49", "Welcome back! It's been ages. How have you been?", "ryan", "English"],
++  ["c50", "Step one: preheat the oven to two hundred degrees. Step two: mix the flour and sugar.", "ryan", "English"]
++]
+diff --git a/src/tools/qwen3_tts/calibrate_entropy.py b/src/tools/qwen3_tts/calibrate_entropy.py
+new file mode 100644
+index 00000000..b524a980
+--- /dev/null
++++ b/src/tools/qwen3_tts/calibrate_entropy.py
+@@ -0,0 +1,186 @@
++"""Calibrate the garble detector's entropy threshold on the deployed NPU path.
++
++The serving engine fails a segment attempt when the talker's code0 entropy, averaged over
++the last `entropy_window` frames, exceeds `entropy_threshold` (see detector.json). That
++statistic depends on the talker package and the NPU numerics, so it is calibrated by
++generating real segments with flm and labeling them by ASR.
++
++usage:
++  1. start flm with checks off and every segment recorded:
++       FLM_TTS_CALIBRATION_DIR=<dir> flm serve qwen3-tts:1.7b
++  2. calibrate_entropy.py generate --dir <dir> [--texts calib_entropy_texts.json] [--seeds 6]
++       speaks every text with each seed (the server segments them as in production); the
++       server writes <dir>/segments.jsonl (text, frames, per-frame entropy) and one WAV per
++       segment. Stop flm afterwards.
++  3. calibrate_entropy.py label --dir <dir> [--threads 8]
++       Whisper large-v3-turbo transcribes each segment; CER against its text ->
++       <dir>/labels.jsonl. Clean: CER < 0.25, failed: CER > 0.5, in between: unused.
++  4. calibrate_entropy.py fit --dir <dir> [--max-fp 0.0075]
++       per segment the maximum windowed mean entropy; picks the lowest threshold on a 0.1
++       grid whose false-positive rate on clean segments is <= --max-fp; prints the table;
++       writes <dir>/fit.json
++  5. calibrate_entropy.py write --dir <dir> --package <package_dir> [--update-default]
++       puts the threshold and the calibration record into <package_dir>/package.json
++       ("detector"); --update-default also updates detector.json next to this script, from
++       which future packages are built.
++
++Expect about 3 h of audio for 6 seeds (about 1800 segments, of which 2-3% fail): about 2 h
++of generation and 3 h of ASR on 8 CPU threads. Fewer than ~30 failed segments or ~400 clean
++ones give a noisy threshold.
++"""
++import argparse, datetime, json, sys, unicodedata, urllib.request
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++PUNCT = set("、。，．,.!?！？「」『』（）()・…ー〜~：:；;\"' 　")
++
++
++def norm(s):
++    return "".join(c for c in unicodedata.normalize("NFKC", s) if c not in PUNCT and not c.isspace())
++
++
++def edit(a, b):
++    prev = list(range(len(b) + 1))
++    for i in range(1, len(a) + 1):
++        cur = [i] + [0] * len(b)
++        for j in range(1, len(b) + 1):
++            cur[j] = min(prev[j - 1] + (a[i - 1] != b[j - 1]), prev[j] + 1, cur[j - 1] + 1)
++        prev = cur
++    return prev[-1]
++
++
++def segments(d):
++    return [json.loads(l) for l in open(d / "segments.jsonl", encoding="utf-8")]
++
++
++def cmd_generate(a):
++    texts = json.load(open(a.texts, encoding="utf-8"))
++    for seed in range(1, a.seeds + 1):
++        for t in texts:
++            body = {"input": t["text"], "voice": t.get("voice", a.voice), "language": t.get("language", ""),
++                    "seed": seed, "response_format": "pcm"}
++            req = urllib.request.Request(a.server + "/v1/audio/speech", data=json.dumps(body).encode(),
++                                         headers={"Content-Type": "application/json"})
++            with urllib.request.urlopen(req) as r:
++                r.read()
++            print(f"seed {seed} {t['id']}", flush=True)
++    print(f"{len(segments(a.dir))} segments recorded in {a.dir}")
++
++
++def cmd_label(a):
++    import soundfile as sf
++    import torch, torchaudio
++    from transformers import WhisperForConditionalGeneration, WhisperProcessor
++    torch.set_num_threads(a.threads)
++    proc = WhisperProcessor.from_pretrained(a.asr)
++    asr = WhisperForConditionalGeneration.from_pretrained(a.asr).eval()
++    out = a.dir / "labels.jsonl"
++    done = {json.loads(l)["id"] for l in open(out, encoding="utf-8")} if out.exists() else set()
++    with open(out, "a", encoding="utf-8") as f:
++        for s in segments(a.dir):
++            if s["id"] in done:
++                continue
++            x, sr = sf.read(a.dir / f"{s['id']}.wav", dtype="float32")
++            hyp = ""
++            for i in range(0, len(x), int(28 * sr)):   # Whisper windows are 30 s
++                y = torchaudio.functional.resample(torch.from_numpy(x[i: i + int(28 * sr)]), sr, 16000).numpy()
++                feats = proc(y, sampling_rate=16000, return_tensors="pt").input_features
++                with torch.no_grad():
++                    ids = asr.generate(feats, language=a.asr_language, task="transcribe", max_new_tokens=220)
++                hyp += proc.batch_decode(ids, skip_special_tokens=True)[0]
++            ref = norm(s["text"])
++            cer = edit(norm(hyp), ref) / max(1, len(ref))
++            f.write(json.dumps({"id": s["id"], "cer": cer, "hyp": hyp}, ensure_ascii=False) + "\n")
++            f.flush()
++            print(f"{s['id']} CER {cer:.2f}", flush=True)
++
++
++def cmd_fit(a):
++    import numpy as np
++    labels = {r["id"]: r["cer"] for r in map(json.loads, open(a.dir / "labels.jsonl", encoding="utf-8"))}
++    det = json.load(open(HERE / "detector.json"))
++    W = a.window or det["entropy_window"]
++    ok, bad = [], []
++    for s in segments(a.dir):
++        cer = labels.get(s["id"])
++        if cer is None or 0.25 <= cer <= 0.5:
++            continue
++        H = np.asarray(s["entropy"], dtype=np.float64)
++        wmax = float(np.convolve(H, np.ones(W) / W, mode="valid").max()) if len(H) >= W else 0.0
++        long_ = s["frames"] >= det["length_factor"] * det["frames_per_token"] * s["text_tokens"] + det["length_slack"]
++        (bad if cer > 0.5 else ok).append((wmax, long_ or s.get("capped", False)))
++    if not ok or not bad:
++        sys.exit("need clean and failed segments; label more data")
++    okw = np.array([w for w, _ in ok]); badw = np.array([w for w, _ in bad]); badl = np.array([l for _, l in bad])
++    print(f"segments: clean {len(ok)}, failed {len(bad)} (window {W} frames)")
++    print(f"clean max-window entropy: p50 {np.median(okw):.2f} p99 {np.percentile(okw, 99):.2f} max {okw.max():.2f}")
++    rows, pick = [], None
++    for thr in np.round(np.arange(1.0, 3.0001, 0.1), 2):
++        fp = float((okw > thr).mean())
++        caught = int((badw > thr).sum()); both = int(((badw > thr) | badl).sum())
++        rows.append({"threshold": float(thr), "false_positive_rate": fp, "caught": caught, "caught_with_length": both})
++        print(f"  {thr:.1f}: false positives {fp * 100:4.1f}% | failed caught {caught}/{len(bad)}, with length check {both}/{len(bad)}")
++        if pick is None and fp <= a.max_fp:
++            pick = rows[-1]
++    if pick is None:
++        sys.exit("no threshold meets --max-fp")
++    print(f"threshold {pick['threshold']} (false positives {pick['false_positive_rate'] * 100:.2f}%, "
++          f"caught {pick['caught']}/{len(bad)}, with length check {pick['caught_with_length']}/{len(bad)})")
++    fit = {"entropy_threshold": pick["threshold"], "entropy_window": W, "max_fp": a.max_fp,
++           "clean": len(ok), "failed": len(bad), "pick": pick, "table": rows,
++           "clean_p50": float(np.median(okw)), "clean_p99": float(np.percentile(okw, 99)), "clean_max": float(okw.max())}
++    json.dump(fit, open(a.dir / "fit.json", "w"), indent=1)
++
++
++def cmd_write(a):
++    fit = json.load(open(a.dir / "fit.json"))
++    seg0 = segments(a.dir)[0]
++    pkg_path = a.package / "package.json"
++    pkg = json.load(open(pkg_path, encoding="utf-8"))
++    det = pkg.get("detector") or json.load(open(HERE / "detector.json"))
++    det["entropy_threshold"] = fit["entropy_threshold"]
++    det["entropy_window"] = fit["entropy_window"]
++    p = fit["pick"]
++    det["calibration"] = {
++        "date": datetime.date.today().isoformat(),
++        "talker": a.talker_note or f"package {a.package.name} (talker sha256 in its build log)",
++        "path": f"NPU talker (fast dispatch), bf16 host heads, T={seg0['temperature']}, voice {seg0['voice']}",
++        "data": f"{fit['clean'] + fit['failed']} segments generated by flm in calibration mode, labeled by Whisper "
++                f"CER: {fit['clean']} clean (CER < 0.25), {fit['failed']} failed (CER > 0.5)",
++        "entropy": "recorded while generating (FLM_TTS_CALIBRATION_DIR)",
++        "false_positive_rate": round(p["false_positive_rate"], 4),
++        "failed_caught_by_entropy": f"{p['caught']}/{fit['failed']}",
++        "failed_caught_with_length_check": f"{p['caught_with_length']}/{fit['failed']}",
++        "clean_window_entropy": {"p50": round(fit["clean_p50"], 3), "p99": round(fit["clean_p99"], 3),
++                                 "max": round(fit["clean_max"], 3)},
++        "rule": f"lowest threshold on a 0.1 grid with false-positive rate <= {fit['max_fp']}",
++    }
++    pkg["detector"] = det
++    pkg_path.write_text(json.dumps(pkg, indent=2, ensure_ascii=False) + "\n")
++    print("updated", pkg_path)
++    if a.update_default:
++        (HERE / "detector.json").write_text(json.dumps(det, indent=2, ensure_ascii=False) + "\n")
++        print("updated", HERE / "detector.json")
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    sub = ap.add_subparsers(dest="cmd", required=True)
++    g = sub.add_parser("generate"); g.add_argument("--dir", type=Path, required=True)
++    g.add_argument("--server", default="http://127.0.0.1:52625")
++    g.add_argument("--texts", default=str(HERE / "calib_entropy_texts.json"))
++    g.add_argument("--seeds", type=int, default=6); g.add_argument("--voice", default="ono_anna")
++    l = sub.add_parser("label"); l.add_argument("--dir", type=Path, required=True)
++    l.add_argument("--threads", type=int, default=8)
++    l.add_argument("--asr", default="openai/whisper-large-v3-turbo"); l.add_argument("--asr-language", default="ja")
++    f = sub.add_parser("fit"); f.add_argument("--dir", type=Path, required=True)
++    f.add_argument("--max-fp", type=float, default=0.0075); f.add_argument("--window", type=int, default=0)
++    w = sub.add_parser("write"); w.add_argument("--dir", type=Path, required=True)
++    w.add_argument("--package", type=Path, required=True); w.add_argument("--update-default", action="store_true")
++    w.add_argument("--talker-note", default="")
++    a = ap.parse_args()
++    {"generate": cmd_generate, "label": cmd_label, "fit": cmd_fit, "write": cmd_write}[a.cmd](a)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/tools/qwen3_tts/capture_calib.py b/src/tools/qwen3_tts/capture_calib.py
+new file mode 100644
+index 00000000..f8a73380
+--- /dev/null
++++ b/src/tools/qwen3_tts/capture_calib.py
+@@ -0,0 +1,82 @@
++"""Capture talker activation statistics from official TTS runs, for GPTQ / AWQ.
++
++usage: capture_calib.py <tts_dir> <out_dir> [--max-rows 4096] [--threads 8]
++
++Runs the official FP32 pipeline (default sampling, seed 7) on the sentences of
++calib_runs.json (disjoint from the evaluation sentences), with forward pre-hooks on
++every talker linear input:
++  attn : input of q/k/v_proj (after input_layernorm)            [2048]
++  o    : input of o_proj (attention output)                     [2048]
++  mlp  : input of gate/up_proj (after post_attention_layernorm) [2048]
++  down : input of down_proj (silu(gate) * up)                   [6144]
++For each, <out_dir>/<layer>.<input>.pt holds H = sum x x^T (fp32), n rows, and a
++reservoir sample of rows (fp16) for AWQ.
++"""
++import argparse
++import json
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++from qwen_tts import Qwen3TTSModel
++
++HERE = Path(__file__).resolve().parent
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("tts_dir")
++    ap.add_argument("out", type=Path)
++    ap.add_argument("--max-rows", type=int, default=4096)
++    ap.add_argument("--texts", type=Path, default=HERE / "calib_runs.json")
++    ap.add_argument("--threads", type=int, default=8)
++    a = ap.parse_args()
++    calib = json.loads(a.texts.read_text())
++    a.out.mkdir(parents=True, exist_ok=True)
++    torch.set_num_threads(a.threads)
++    torch.manual_seed(7)
++    tts = Qwen3TTSModel.from_pretrained(a.tts_dir, device_map="cpu", dtype=torch.float32)
++    rng = np.random.default_rng(0)
++    max_rows = a.max_rows
++
++    stats = {}
++
++    def make_hook(key, dim):
++        stats[key] = {"H": torch.zeros(dim, dim), "n": 0, "rows": [], "seen": 0}
++
++        def hook(mod, args):
++            x = args[0].detach().reshape(-1, dim).float()
++            st = stats[key]
++            st["H"].addmm_(x.T, x)
++            st["n"] += x.shape[0]
++            for r in x:  # reservoir sample of rows
++                st["seen"] += 1
++                if len(st["rows"]) < max_rows:
++                    st["rows"].append(r.half())
++                else:
++                    j = rng.integers(0, st["seen"])
++                    if j < max_rows:
++                        st["rows"][j] = r.half()
++        return hook
++
++    for l, layer in enumerate(tts.model.talker.model.layers):
++        at, mlp = layer.self_attn, layer.mlp
++        at.q_proj.register_forward_pre_hook(make_hook(f"{l}.attn", at.q_proj.in_features))
++        at.o_proj.register_forward_pre_hook(make_hook(f"{l}.o", at.o_proj.in_features))
++        mlp.gate_proj.register_forward_pre_hook(make_hook(f"{l}.mlp", mlp.gate_proj.in_features))
++        mlp.down_proj.register_forward_pre_hook(make_hook(f"{l}.down", mlp.down_proj.in_features))
++
++    t0 = time.time()
++    for i, (text, spk, lang) in enumerate(calib):
++        wavs, sr = tts.generate_custom_voice(text=text, speaker=spk, language=lang)
++        print(f"[{i + 1}/{len(calib)}] {len(wavs[0]) / sr:.1f}s audio, rows so far {stats['0.attn']['n']} "
++              f"({time.time() - t0:.0f}s)", flush=True)
++
++    for key, st in stats.items():
++        torch.save({"H": st["H"], "n": st["n"], "rows": torch.stack(st["rows"])}, a.out / f"{key}.pt")
++    print("saved", len(stats), "inputs to", a.out)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/tools/qwen3_tts/capture_tf.py b/src/tools/qwen3_tts/capture_tf.py
+new file mode 100644
+index 00000000..e00cc62d
+--- /dev/null
++++ b/src/tools/qwen3_tts/capture_tf.py
+@@ -0,0 +1,88 @@
++"""Add teacher-forced activation statistics to a calibration capture.
++
++usage: capture_tf.py <tts_dir> <traj_dir> <base_calib_dir> <out_dir> [--max-rows 4096] [--threads 8]
++
++For every <traj_dir>/codes/<sentence>_s<seed>.i32 (from gen_trajectories.py): rebuild the
++talker inputs (prefill + per-frame codec embedding sums + tts_pad), run the official FP32
++talker once over the whole sequence with input hooks, and add sum x x^T, n and a quarter
++of the rows (random) to the base capture (capture_calib.py). The row pool is then
++subsampled back to max_rows per input.
++"""
++import argparse
++import json
++from pathlib import Path
++
++import numpy as np
++import torch
++from safetensors import safe_open
++from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
++from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSTalkerModel
++
++KEYS = {"attn": "self_attn.q_proj", "o": "self_attn.o_proj", "mlp": "mlp.gate_proj", "down": "mlp.down_proj"}
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    for name in ("tts_dir", "traj_dir", "base", "out"):
++        ap.add_argument(name, type=Path)
++    ap.add_argument("--max-rows", type=int, default=4096)
++    ap.add_argument("--threads", type=int, default=8)
++    a = ap.parse_args()
++    a.out.mkdir(parents=True, exist_ok=True)
++    torch.set_num_threads(a.threads)
++    cfg = Qwen3TTSConfig.from_pretrained(a.tts_dir).talker_config
++    cfg._attn_implementation = "eager"
++    model = Qwen3TTSTalkerModel(cfg).float().eval()
++    f = safe_open(a.tts_dir / "model.safetensors", "pt")
++    model.load_state_dict({k[len("talker.model."):]: f.get_tensor(k).float()
++                           for k in f.keys() if k.startswith("talker.model.")})
++    cp_emb = [f.get_tensor(f"talker.code_predictor.model.codec_embedding.{k}.weight").float() for k in range(15)]
++
++    stats = {}
++    for l in range(cfg.num_hidden_layers):
++        for k in KEYS:
++            stats[f"{l}.{k}"] = torch.load(a.base / f"{l}.{k}.pt")
++    rng = np.random.default_rng(1)
++    added = {key: [] for key in stats}
++
++    def make_hook(key):
++        def hook(mod, args):
++            x = args[0].detach().reshape(-1, args[0].shape[-1]).float()
++            stats[key]["H"].addmm_(x.T, x)
++            stats[key]["n"] += x.shape[0]
++            added[key].append(x[rng.permutation(x.shape[0])[: max(1, x.shape[0] // 4)]].half())
++        return hook
++
++    for l, layer in enumerate(model.layers):
++        for k, path in KEYS.items():
++            mod = layer
++            for part in path.split("."):
++                mod = getattr(mod, part)
++            mod.register_forward_pre_hook(make_hook(f"{l}.{k}"))
++
++    files = sorted((a.traj_dir / "codes").glob("*.i32"))
++    rows = 0
++    for i, cf in enumerate(files):
++        d = a.traj_dir / "prompts" / cf.name.split("_s")[0]
++        P = json.loads((d / "meta.json").read_text())["P"]
++        E = torch.from_numpy(np.fromfile(d / "prefill.f32", dtype=np.float32)).view(P, -1)
++        pad = torch.from_numpy(np.fromfile(d / "tts_pad.f32", dtype=np.float32))
++        codes = torch.from_numpy(np.fromfile(cf, dtype=np.int32).reshape(-1, 16)).long()
++        steps = [model.codec_embedding.weight[codes[:, 0]]] + [cp_emb[k][codes[:, k + 1]] for k in range(15)]
++        X = torch.cat([E, (sum(steps) + pad)[:-1]], 0)[None]   # inputs up to the last generated frame
++        with torch.no_grad():
++            model(inputs_embeds=X, use_cache=False)
++        rows += X.shape[1]
++        if (i + 1) % 20 == 0:
++            print(f"[{i + 1}/{len(files)}] rows added {rows}", flush=True)
++
++    for key, st in stats.items():
++        new = torch.cat(added[key]) if added[key] else st["rows"][:0]
++        pool = torch.cat([st["rows"], new])
++        keep = torch.from_numpy(rng.permutation(pool.shape[0])[:a.max_rows])
++        torch.save({"H": st["H"], "n": st["n"], "rows": pool[keep]}, a.out / f"{key}.pt")
++    print(f"done: {len(files)} trajectories, {rows} rows added; n(0.attn) = {stats['0.attn']['n']}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/tools/qwen3_tts/configs/Qwen3-0.6B-NPU2.json b/src/tools/qwen3_tts/configs/Qwen3-0.6B-NPU2.json
+new file mode 100644
+index 00000000..59f8fd3b
+--- /dev/null
++++ b/src/tools/qwen3_tts/configs/Qwen3-0.6B-NPU2.json
+@@ -0,0 +1,36 @@
++{
++  "architectures": [
++    "Qwen3ForCausalLM"
++  ],
++  "attention_bias": false,
++  "attention_dropout": 0.0,
++  "bos_token_id": 151643,
++  "eos_token_id": 151645,
++  "head_dim": 128,
++  "hidden_act": "silu",
++  "hidden_size": 1024,
++  "initializer_range": 0.02,
++  "intermediate_size": 3072,
++  "max_position_embeddings": 40960,
++  "max_window_layers": 28,
++  "model_type": "qwen3",
++  "num_attention_heads": 16,
++  "num_hidden_layers": 28,
++  "num_key_value_heads": 8,
++  "rms_norm_eps": 1e-06,
++  "rope_scaling": null,
++  "rope_theta": 1000000,
++  "sliding_window": null,
++  "tie_word_embeddings": true,
++  "torch_dtype": "bfloat16",
++  "transformers_version": "4.51.0",
++  "use_cache": true,
++  "use_sliding_window": false,
++  "vocab_size": 151936,
++  "addr_qk": 9216,
++  "addr_kv": 33792,
++  "addr_l_begin_mha": 53760,
++  "addr_l_end_mha": 25088,
++  "addr_kk": 45056,
++  "flm_version": "0.9.22"
++}
+diff --git a/src/tools/qwen3_tts/configs/Qwen3-1.7B-NPU2.json b/src/tools/qwen3_tts/configs/Qwen3-1.7B-NPU2.json
+new file mode 100644
+index 00000000..7164ffc8
+--- /dev/null
++++ b/src/tools/qwen3_tts/configs/Qwen3-1.7B-NPU2.json
+@@ -0,0 +1,36 @@
++{
++  "architectures": [
++    "Qwen3ForCausalLM"
++  ],
++  "attention_bias": false,
++  "attention_dropout": 0.0,
++  "bos_token_id": 151643,
++  "eos_token_id": 151645,
++  "head_dim": 128,
++  "hidden_act": "silu",
++  "hidden_size": 2048,
++  "initializer_range": 0.02,
++  "intermediate_size": 6144,
++  "max_position_embeddings": 40960,
++  "max_window_layers": 28,
++  "model_type": "qwen3",
++  "num_attention_heads": 16,
++  "num_hidden_layers": 28,
++  "num_key_value_heads": 8,
++  "rms_norm_eps": 1e-06,
++  "rope_scaling": null,
++  "rope_theta": 1000000,
++  "sliding_window": null,
++  "tie_word_embeddings": true,
++  "torch_dtype": "bfloat16",
++  "transformers_version": "4.51.0",
++  "use_cache": true,
++  "use_sliding_window": false,
++  "vocab_size": 151936,
++  "addr_qk": 9216,
++  "addr_kv": 33792,
++  "addr_l_begin_mha": 53760,
++  "addr_l_end_mha": 25088,
++  "addr_kk": 45056,
++  "flm_version": "0.9.22"
++}
+diff --git a/src/tools/qwen3_tts/detector.json b/src/tools/qwen3_tts/detector.json
+new file mode 100644
+index 00000000..91eb8b11
+--- /dev/null
++++ b/src/tools/qwen3_tts/detector.json
+@@ -0,0 +1,22 @@
++{
++  "entropy_threshold": 1.7,
++  "entropy_window": 25,
++  "length_factor": 1.8,
++  "frames_per_token": 3.34,
++  "length_slack": 10,
++  "cap_per_token": 7.5,
++  "cap_const": 15,
++  "reason": "Garble detector of the serving engine. A segment attempt fails when the talker's code0 entropy (nats, at the sampling temperature, after the repetition penalty and masks), averaged over the last entropy_window frames, exceeds entropy_threshold; or, once its text is complete, when it runs longer than length_factor * frames_per_token * text_tokens + length_slack frames; or at the hard cap cap_per_token * text_tokens + cap_const frames. The threshold is the lowest value on a 0.1 grid whose false-positive rate on clean segments is at most 0.75%: a false positive on the first segment of a reply is heard (it is cut and spoken again); on later segments it only costs a regeneration. On clean segments the windowed entropy peaks at p50 1.07 / p99 1.57 / max 1.82; most garbled segments exceed 2.0. The FP32-model threshold (1.36) flags 6.4% of clean NPU segments, so it must be calibrated on the deployed NPU path.",
++  "calibration": {
++    "date": "2026-10-19",
++    "talker": "validated AWQ+GPTQ package (prototype calibration trajectories)",
++    "path": "NPU talker (fast dispatch), bf16 host heads, T=0.9, top-k 50, repetition penalty 1.05, voice ono_anna",
++    "data": "468 segments of Japanese LLM replies generated on the NPU, labeled by Whisper large-v3-turbo CER against the text: 427 clean (CER < 0.25), 41 failed (CER > 0.5); segments with CER in between are not used",
++    "entropy": "teacher-forced recorded codes through the NPU talker (equal to the entropy computed while generating)",
++    "false_positive_rate": 0.0070,
++    "failed_caught_by_entropy": "22/41",
++    "failed_caught_with_length_check": "27/41",
++    "note": "Most uncaught failures are very short replies misheard by the ASR rather than garbled audio."
++  },
++  "recalibrate": "src/tools/qwen3_tts/README.md, section 'Recalibrating the garble detector' (calibrate_entropy.py)"
++}
+diff --git a/src/tools/qwen3_tts/export_tokenizer.py b/src/tools/qwen3_tts/export_tokenizer.py
+new file mode 100644
+index 00000000..2ca9fd5f
+--- /dev/null
++++ b/src/tools/qwen3_tts/export_tokenizer.py
+@@ -0,0 +1,74 @@
++"""Export the Qwen3-TTS text tokenizer as a single HF `tokenizers` tokenizer.json.
++
++usage: export_tokenizer.py <tts_dir> <out/tokenizer.json>
++
++The HF checkpoint ships vocab.json + merges.txt + tokenizer_config.json only. This loads the
++tokenizer exactly as qwen_tts does (AutoProcessor, fix_mistral_regex=True) and saves its
++fast backend. Note: with that flag and the checkpoint's transformers_version (4.57.3),
++transformers replaces the Qwen2 pre-tokenizer regex with the corrected Mistral one, so
++the official pipeline splits English contractions / case runs differently from a plain
++AutoTokenizer; the export follows the official pipeline.
++
++The written file is re-loaded with the `tokenizers` library (the same Rust crate as
++tokenizers-cpp) and must encode the calibration sentences, mixed-script probes and the
++assistant prompt template identically to the official tokenizer.
++"""
++import argparse
++import json
++from pathlib import Path
++
++from tokenizers import Tokenizer
++from transformers import AutoConfig, AutoProcessor, AutoTokenizer
++from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
++from qwen_tts.core.models.processing_qwen3_tts import Qwen3TTSProcessor
++
++HERE = Path(__file__).resolve().parent
++PROBES = [
++    "Hello! This is a quick test of text to speech running on the NPU.",
++    "I'm sure it's fine, don't WORRY. They'll say we've done it; HelloWorld OK'S",
++    "こんにちは。今日はとてもいい天気ですね。",
++    "令和七年三月十五日、約二千五百人が参加し、売上高は前年比百十二パーセントに達しました。",
++    "このNPUで I'll test 123,456円! ＡＢＣ　全角 and emoji 🎉 tabs\tand\nnewlines\r\n",
++    "안녕하세요. 오늘 날씨가 정말 좋네요.",
++]
++
++
++def official_tokenizer(tts_dir):
++    AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
++    AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
++    return AutoProcessor.from_pretrained(tts_dir, fix_mistral_regex=True).tokenizer
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("tts_dir")
++    ap.add_argument("out", type=Path)
++    a = ap.parse_args()
++    tok = official_tokenizer(a.tts_dir)
++    tmp = a.out.with_suffix(".tmp")
++    tok.backend_tokenizer.save(str(tmp), pretty=True)
++
++    texts = list(PROBES)
++    for name in ("calib_runs.json", "calib_trajectories.json"):
++        texts += [row[-3] for row in json.loads((HERE / name).read_text())]
++    texts += [f"<|im_start|>assistant\n{t}<|im_end|>\n<|im_start|>assistant\n" for t in texts]
++    exported = Tokenizer.from_file(str(tmp))
++    plain = AutoTokenizer.from_pretrained(a.tts_dir)
++    bad, plain_diff = 0, 0
++    for t in texts:
++        ref = tok(t)["input_ids"]
++        got = exported.encode(t).ids
++        if got != ref:
++            bad += 1
++            print("MISMATCH", repr(t[:60]), ref[:12], got[:12])
++        plain_diff += plain(t)["input_ids"] != ref
++    print(f"checked {len(texts)} strings: {bad} mismatches vs the official tokenizer "
++          f"({plain_diff} differ between plain AutoTokenizer and the official tokenizer)")
++    if bad:
++        raise SystemExit(1)
++    tmp.rename(a.out)
++    print("wrote", a.out)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/tools/qwen3_tts/gen_trajectories.py b/src/tools/qwen3_tts/gen_trajectories.py
+new file mode 100644
+index 00000000..21d9b64c
+--- /dev/null
++++ b/src/tools/qwen3_tts/gen_trajectories.py
+@@ -0,0 +1,80 @@
++"""Generate FP32 talker trajectories with the official pipeline, for teacher-forced calibration.
++
++usage: gen_trajectories.py <tts_dir> <out_dir> [--seeds 3] [--threads 8]
++
++For every sentence of calib_trajectories.json and seed s in 0..seeds-1, runs the official
++FP32 pipeline (non-streaming text, default sampling from generation_config.json:
++T 0.9, top-k 50, repetition penalty 1.05, sub-talker T 0.9 / top-k 50) after
++torch.manual_seed(s). The audio decoder is skipped. Writes:
++  <out>/prompts/<id>/prefill.f32  [P, D] talker prefill inputs_embeds
++  <out>/prompts/<id>/tts_pad.f32  [D]    tts_pad_embed added to every decode-step input
++  <out>/prompts/<id>/meta.json    sentence, speaker, language, P, D
++  <out>/codes/<id>_s<s>.i32       [T, 16] generated codes (EOS frame excluded)
++Existing outputs are kept, so an interrupted run resumes where it stopped.
++"""
++import argparse
++import json
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++from qwen_tts import Qwen3TTSModel
++
++HERE = Path(__file__).resolve().parent
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("tts_dir")
++    ap.add_argument("out", type=Path)
++    ap.add_argument("--texts", type=Path, default=HERE / "calib_trajectories.json")
++    ap.add_argument("--seeds", type=int, default=3)
++    ap.add_argument("--threads", type=int, default=8)
++    a = ap.parse_args()
++    sentences = json.loads(a.texts.read_text())
++    torch.set_num_threads(a.threads)
++    tts = Qwen3TTSModel.from_pretrained(a.tts_dir, device_map="cpu", dtype=torch.float32)
++    talker = tts.model.talker
++    real_generate = talker.generate
++    cap = {}
++
++    def grab_generate(**kw):
++        cap["prefill"] = kw["inputs_embeds"][0].float().numpy()
++        cap["pad"] = kw["tts_pad_embed"].reshape(-1).float().numpy()
++        return real_generate(**kw)
++
++    def grab_decode(items, *args, **kw):  # keep the codes, skip the audio decoder
++        cap["codes"] = items[0]["audio_codes"].cpu().numpy().astype(np.int32)
++        return [np.zeros(1, dtype=np.float32)], 24000
++
++    talker.generate = grab_generate
++    tts.model.speech_tokenizer.decode = grab_decode
++    (a.out / "codes").mkdir(parents=True, exist_ok=True)
++    t0, frames = time.time(), 0
++    for sid, text, speaker, lang in sentences:
++        pd = a.out / "prompts" / sid
++        for seed in range(a.seeds):
++            cf = a.out / "codes" / f"{sid}_s{seed}.i32"
++            if cf.exists() and (pd / "meta.json").exists():
++                continue
++            torch.manual_seed(seed)
++            tts.generate_custom_voice(text=text, speaker=speaker, language=lang, non_streaming_mode=True)
++            if not (pd / "meta.json").exists():
++                pd.mkdir(parents=True, exist_ok=True)
++                cap["prefill"].astype(np.float32).tofile(pd / "prefill.f32")
++                cap["pad"].astype(np.float32).tofile(pd / "tts_pad.f32")
++                P, D = cap["prefill"].shape
++                (pd / "meta.json").write_text(json.dumps(
++                    {"id": sid, "text": text, "speaker": speaker, "language": lang, "P": P, "D": D},
++                    ensure_ascii=False, indent=1))
++            tmp = cf.with_suffix(".tmp")
++            cap["codes"].tofile(tmp)
++            tmp.rename(cf)
++            frames += cap["codes"].shape[0]
++            print(f"{sid} s{seed}: {cap['codes'].shape[0]} frames ({time.time() - t0:.0f}s)", flush=True)
++    print(f"done: {len(sentences)} sentences x {a.seeds} seeds, {frames} new frames")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/tools/qwen3_tts/make_predictor.py b/src/tools/qwen3_tts/make_predictor.py
+new file mode 100644
+index 00000000..082d324d
+--- /dev/null
++++ b/src/tools/qwen3_tts/make_predictor.py
+@@ -0,0 +1,55 @@
++"""Package the Qwen3-TTS code predictor as a stock Qwen3 Q4NX model for the qwen3_npu engine.
++
++usage: make_predictor.py <tts_dir> <out_model_dir>
++  out_model_dir must end in Qwen3-0.6B-NPU2 (the engine picks xclbins by folder name)
++
++talker.code_predictor.model.* has Qwen3-0.6B shapes with 5 layers. Linears are min/max
++quantized to Q4NX; norms stay BF16.
++  embed_tokens: zero scratch rows; the runtime injects each input embedding into one
++  lm_head:      identity, so the engine returns the final normed hidden state
++"""
++import argparse
++import json
++import sys
++from pathlib import Path
++
++import torch
++from safetensors import safe_open
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++import q4nx  # noqa: E402
++
++PREFIX = "talker.code_predictor.model."
++VOCAB = 151936   # engine vocab; must stay the stock size, identity fills the first D rows
++QUANT = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("tts_dir", type=Path)
++    ap.add_argument("out", type=Path)
++    ap.add_argument("--threads", type=int, default=8)
++    a = ap.parse_args()
++    assert a.out.name == "Qwen3-0.6B-NPU2", a.out
++    torch.set_num_threads(a.threads)
++    a.out.mkdir(parents=True, exist_ok=True)
++    sub = json.loads((a.tts_dir / "config.json").read_text())["talker_config"]["code_predictor_config"]
++    D = sub["hidden_size"]
++
++    tensors = {"model.embed_tokens.weight": torch.zeros(VOCAB, D)}
++    with safe_open(a.tts_dir / "model.safetensors", "pt") as f:
++        for k in sorted(f.keys()):
++            if not (k.startswith(PREFIX + "layers.") or k == PREFIX + "norm.weight"):
++                continue
++            name = "model." + k[len(PREFIX):]
++            t = f.get_tensor(k)
++            tensors[name] = q4nx.quantize(t) if any(p in name for p in QUANT) else t
++    tensors["lm_head.weight"] = q4nx.identity_head(VOCAB, D)
++    q4nx.write(a.out / "model.q4nx", tensors)
++    q4nx.write_config(HERE / "configs/Qwen3-0.6B-NPU2.json", sub, VOCAB, a.out / "config.json")
++    print("wrote", a.out, len(tensors), "tensors")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/tools/qwen3_tts/q4nx.py b/src/tools/qwen3_tts/q4nx.py
+new file mode 100644
+index 00000000..f9da2b1e
+--- /dev/null
++++ b/src/tools/qwen3_tts/q4nx.py
+@@ -0,0 +1,124 @@
++"""Writer for FastFlowLM's Q4NX format, plus the engine config.json for a packaged model.
++
++A quantized [rows, cols] matrix is split into 32x256 tiles, stored row-block-major as
++I8 [n_tiles, 5120]. Each tile:
++  bytes    0..511   bf16 scale S[g*32 + r]   (g = 32-col group 0..7, r = row 0..31)
++  bytes  512..1023  bf16 offset M[g*32 + r]
++  bytes 1024..5119  codes: byte[(h*256 + c)*8 + t], low nibble -> row h*16+2t, high -> row h*16+2t+1
++  w = q * S + M   (q in 0..15; the NPU kernels use this offset form, not (q - Z) * S)
++
++The container is safetensors-shaped: u64 header length, JSON header, raw tensor data.
++Non-quantized tensors are stored BF16.
++"""
++import json
++import struct
++from pathlib import Path
++
++import numpy as np
++import torch
++
++TILE_R, TILE_C, GROUP = 32, 256, 32
++
++# config.json fields taken from the TTS sub-model; everything else comes from the stock template
++ARCH_KEYS = ("hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
++             "num_key_value_heads", "head_dim", "rms_norm_eps", "rope_theta")
++
++
++def quantize(w: torch.Tensor, fixed_scale: float = None) -> np.ndarray:
++    """min/max quantization: [rows, cols] float -> uint8 [n_tiles, 5120]
++
++    fixed_scale: use this scale with offset 0 everywhere, for matrices whose
++    entries are exact multiples of it (the identity lm_head uses 0.125).
++    """
++    w = w.float()
++    rows, cols = w.shape
++    assert rows % TILE_R == 0 and cols % TILE_C == 0, (rows, cols)
++    g = w.view(rows, cols // GROUP, GROUP)
++    if fixed_scale is not None:
++        s = torch.full(g.shape[:2], fixed_scale)
++        m = torch.zeros(g.shape[:2])
++    else:
++        lo = g.amin(-1)
++        hi = g.amax(-1)
++        s = ((hi - lo) / 15).clamp(min=1e-8).to(torch.bfloat16).float()
++        m = lo.to(torch.bfloat16).float()
++    q = torch.round((g - m[..., None]) / s[..., None]).clamp(0, 15).to(torch.uint8).view(rows, cols)
++    return pack(q, s, m)
++
++
++def pack(q: torch.Tensor, s: torch.Tensor, m: torch.Tensor) -> np.ndarray:
++    """codes q uint8 [rows, cols] in 0..15, scale s and offset m [rows, cols/32] -> tiles.
++    w = q * s + m; s and m are stored as bf16 (round them before choosing q)."""
++    rows, cols = q.shape
++    rb, cb = rows // TILE_R, cols // TILE_C
++
++    def tile_sz(x):  # [rows, cols/32] -> [rb, cb, g(8), r(32)]
++        x = x.to(torch.bfloat16).view(rb, TILE_R, cb, TILE_C // GROUP)
++        return x.permute(0, 2, 3, 1).contiguous().view(torch.int16).numpy().view(np.uint8).reshape(rb, cb, 512)
++
++    S, M = tile_sz(s), tile_sz(m)
++    # codes: [rows, cols] -> [rb, cb, h(2), c(256), t(8), pair(2)]
++    qt = q.view(rb, 2, 8, 2, cb, TILE_C).permute(0, 4, 1, 5, 2, 3).contiguous()
++    codes = (qt[..., 0] | (qt[..., 1] << 4)).numpy().reshape(rb, cb, 4096)
++    return np.concatenate([S, M, codes], axis=-1).reshape(rb * cb, 5120)
++
++
++def dequantize(t: np.ndarray, rows: int, cols: int) -> torch.Tensor:
++    """tiles -> [rows, cols] fp32 (inverse of pack; for verifying packages)"""
++    rb, cb = rows // TILE_R, cols // TILE_C
++    t = t.reshape(rb, cb, 5120)
++
++    def untile_sz(x):
++        x = torch.from_numpy(np.ascontiguousarray(x)).view(torch.bfloat16).float().view(rb, cb, 8, 32)
++        return x.permute(0, 3, 1, 2).reshape(rows, cols // GROUP)
++
++    S, M = untile_sz(t[..., :512]), untile_sz(t[..., 512:1024])
++    c = torch.from_numpy(np.ascontiguousarray(t[..., 1024:])).view(rb, cb, 2, TILE_C, 8)
++    q = torch.stack([c & 15, c >> 4], -1).permute(0, 2, 4, 5, 1, 3).reshape(rows, cols).float()
++    return (q.view(rows, cols // GROUP, GROUP) * S[..., None] + M[..., None]).view(rows, cols)
++
++
++def identity_head(vocab: int, dim: int) -> np.ndarray:
++    """lm_head = identity in the first dim rows, so the engine's logits are the final normed hidden state"""
++    return quantize(torch.eye(vocab, dim), fixed_scale=0.125)
++
++
++def write(path, tensors: dict):
++    """tensors: name -> torch.Tensor (stored bf16) or np.uint8 array (stored I8), in file order"""
++    header, blobs, off = {}, [], 0
++    for name, t in tensors.items():
++        if isinstance(t, np.ndarray):
++            raw, dtype, shape = t.tobytes(), "I8", list(t.shape)
++        else:
++            t = t.to(torch.bfloat16).contiguous()
++            raw, dtype, shape = t.view(torch.int16).numpy().tobytes(), "BF16", list(t.shape)
++        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [off, off + len(raw)]}
++        blobs.append(raw)
++        off += len(raw)
++    h = json.dumps(header, separators=(",", ":")).encode()
++    h += b" " * ((8 - len(h) % 8) % 8)
++    with open(path, "wb") as f:
++        f.write(struct.pack("<Q", len(h)))
++        f.write(h)
++        for b in blobs:
++            f.write(b)
++
++
++def read(path) -> dict:
++    """model.q4nx -> name -> (dtype, shape, raw np.uint8 bytes); for verifying packages"""
++    with open(path, "rb") as f:
++        n = struct.unpack("<Q", f.read(8))[0]
++        header = json.loads(f.read(n))
++        data = np.fromfile(f, dtype=np.uint8)
++    return {k: (v["dtype"], v["shape"], data[v["data_offsets"][0]:v["data_offsets"][1]]) for k, v in header.items()}
++
++
++def write_config(template: Path, sub_cfg: dict, vocab: int, out: Path):
++    """stock engine config.json with the architecture fields of the TTS sub-model"""
++    cfg = json.loads(Path(template).read_text())
++    for k in ARCH_KEYS:
++        if cfg.get(k) != sub_cfg.get(k):
++            print(f"config {k}: {cfg.get(k)} -> {sub_cfg[k]}")
++            cfg[k] = sub_cfg[k]
++    cfg["vocab_size"] = vocab
++    Path(out).write_text(json.dumps(cfg, indent=2))
+diff --git a/src/tools/qwen3_tts/quantize_talker.py b/src/tools/qwen3_tts/quantize_talker.py
+new file mode 100644
+index 00000000..af6bbf7f
+--- /dev/null
++++ b/src/tools/qwen3_tts/quantize_talker.py
+@@ -0,0 +1,197 @@
++"""Quantize the Qwen3-TTS talker to Q4NX with AWQ + GPTQ, as a stock Qwen3-1.7B model.
++
++usage: quantize_talker.py <tts_dir> <calib_dir> <out_model_dir> [--threads 8]
++  calib_dir: activation statistics from capture_calib.py + capture_tf.py
++  out_model_dir must end in Qwen3-1.7B-NPU2 (the engine picks xclbins by folder name)
++
++Q4NX group = 32 consecutive input features of one output row, asymmetric:
++w = q * S + M, q in 0..15, S/M bf16.
++  AWQ:  per-input-channel scales for q/k/v (folded into input_layernorm), gate/up
++        (folded into post_attention_layernorm), down (folded into up_proj) and o
++        (folded into v_proj, one scale per v channel shared by its query heads)
++  GPTQ: column-wise error feedback on the scaled weights with the calibration Hessian;
++        each group's (S, M) is a weighted-MSE clipping search on the updated weights
++embed_tokens is zero scratch rows (inputs are injected at run time); lm_head is identity.
++"""
++import argparse
++import json
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++from safetensors import safe_open
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++import q4nx  # noqa: E402
++
++G = 32
++VOCAB = 151936
++LINEARS = {"attn": ["q_proj", "k_proj", "v_proj"], "o": ["o_proj"], "mlp": ["gate_proj", "up_proj"], "down": ["down_proj"]}
++PARENT = {"q_proj": "self_attn", "k_proj": "self_attn", "v_proj": "self_attn", "o_proj": "self_attn",
++          "gate_proj": "mlp", "up_proj": "mlp", "down_proj": "mlp"}
++SHRINK = torch.tensor([1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7])
++
++
++def bf16(x):
++    return x.to(torch.bfloat16).float()
++
++
++def fit_groups(W, imp=None, search=True):
++    """W [N, K] -> (q uint8 [N, K], s [N, K/G], m [N, K/G]); weighted-MSE search over clipping."""
++    N, K = W.shape
++    g = W.view(N, K // G, G)
++    lo, hi = g.amin(-1), g.amax(-1)
++    w8 = None if imp is None else imp.view(1, K // G, G)
++    best_err = torch.full((N, K // G), float("inf"))
++    best_s, best_m = torch.zeros(N, K // G), torch.zeros(N, K // G)
++    cands = [(a, b) for a in SHRINK for b in SHRINK] if search else [(1.0, 1.0)]
++    for a, b in cands:
++        l, h = lo * a, hi * b
++        s = bf16(((h - l) / 15).clamp(min=1e-10))
++        m = bf16(l)
++        q = torch.round((g - m[..., None]) / s[..., None]).clamp(0, 15)
++        e = (q * s[..., None] + m[..., None] - g) ** 2
++        err = (e * w8).sum(-1) if w8 is not None else e.sum(-1)
++        better = err < best_err
++        best_err = torch.where(better, err, best_err)
++        best_s = torch.where(better, s, best_s)
++        best_m = torch.where(better, m, best_m)
++    q = torch.round((g - best_m[..., None]) / best_s[..., None]).clamp(0, 15).to(torch.uint8).view(N, K)
++    return q, best_s, best_m
++
++
++def dequant(q, s, m):
++    N, K = q.shape
++    return (q.view(N, K // G, G).float() * s[..., None] + m[..., None]).view(N, K)
++
++
++def gptq(W, H, search=True, block=128, damp=0.01):
++    """GPTQ with 32-column groups whose (S, M) are fit on the error-updated weights."""
++    W = W.clone()
++    N, K = W.shape
++    H = H.clone()
++    dead = torch.diag(H) == 0
++    H[dead, dead] = 1
++    W[:, dead] = 0
++    H += damp * torch.mean(torch.diag(H)) * torch.eye(K)
++    Hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
++    imp = torch.diag(H)
++    Q = torch.zeros(N, K, dtype=torch.uint8)
++    S = torch.zeros(N, K // G)
++    M = torch.zeros(N, K // G)
++    for i1 in range(0, K, block):
++        i2 = min(i1 + block, K)
++        W1 = W[:, i1:i2].clone()
++        Err1 = torch.zeros_like(W1)
++        Hinv1 = Hinv[i1:i2, i1:i2]
++        for i in range(i2 - i1):
++            col = i1 + i
++            if col % G == 0:
++                _, s, m = fit_groups(W1[:, i:i + G], imp[col:col + G], search)
++                S[:, col // G], M[:, col // G] = s[:, 0], m[:, 0]
++            s, m = S[:, col // G], M[:, col // G]
++            w = W1[:, i]
++            q = torch.round((w - m) / s).clamp(0, 15)
++            Q[:, col] = q.to(torch.uint8)
++            err = (w - (q * s + m)) / Hinv1[i, i]
++            W1[:, i:] -= err[:, None] * Hinv1[i, i:][None, :]
++            Err1[:, i] = err
++        W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
++    return Q, S, M
++
++
++def awq_scale(X, Ws, alphas=np.linspace(0, 1, 21), rows=2048):
++    """per-input-channel scales s minimizing ||X W^T - (X/s) Q(W s)^T|| over the group's linears"""
++    X = X[:rows].float()
++    xm = X.abs().mean(0).clamp(min=1e-6)
++    Wcat = torch.cat(Ws, 0)
++    Y = X @ Wcat.T
++    best, best_s, best_a = float("inf"), torch.ones_like(xm), 0.0
++    for a in alphas:
++        s = xm.pow(float(a))
++        s = s / (s.max() * s.min()).sqrt()
++        Wq = dequant(*fit_groups(Wcat * s[None, :], search=False))
++        loss = ((X / s) @ Wq.T - Y).pow(2).mean().item()
++        if loss < best:
++            best, best_s, best_a = loss, s, float(a)
++    return best_s, best_a
++
++
++def quantize_layer(get, calib, l, nh, nkv, hd):
++    """-> ({linear name: (q, s, m)}, {norm name: folded fp32 weight}) for talker layer l"""
++    p = f"talker.model.layers.{l}."
++    W = {n: get(p + f"{PARENT[n]}.{n}.weight") for n in PARENT}
++    ln1, ln2 = get(p + "input_layernorm.weight"), get(p + "post_attention_layernorm.weight")
++    st = {k: torch.load(calib / f"{l}.{k}.pt") for k in LINEARS}
++    Hs = {k: st[k]["H"] / st[k]["n"] for k in LINEARS}
++
++    s_attn, a1 = awq_scale(st["attn"]["rows"], [W["q_proj"], W["k_proj"], W["v_proj"]])
++    s_mlp, a2 = awq_scale(st["mlp"]["rows"], [W["gate_proj"], W["up_proj"]])
++    s_down, a3 = awq_scale(st["down"]["rows"], [W["down_proj"]])
++    s_o, a4 = awq_scale(st["o"]["rows"], [W["o_proj"]])
++    # o's input channel (q head h, dim d) comes from v head h // (nh/nkv): tie the pair
++    so = s_o.view(nkv, nh // nkv, hd).log().mean(1).exp()       # [nkv, hd]
++    s_o = so[:, None, :].expand(nkv, nh // nkv, hd).reshape(-1)
++    for n in ("q_proj", "k_proj", "v_proj"):
++        W[n] = W[n] * s_attn[None, :]
++    ln1 = ln1 / s_attn
++    for n in ("gate_proj", "up_proj"):
++        W[n] = W[n] * s_mlp[None, :]
++    ln2 = ln2 / s_mlp
++    W["down_proj"] = W["down_proj"] * s_down[None, :]
++    W["up_proj"] = W["up_proj"] / s_down[:, None]
++    W["o_proj"] = W["o_proj"] * s_o[None, :]
++    W["v_proj"] = W["v_proj"] / so.reshape(-1)[:, None]
++    scale = {"attn": s_attn, "mlp": s_mlp, "down": s_down, "o": s_o}
++    Hs = {k: Hs[k] / scale[k][:, None] / scale[k][None, :] for k in Hs}
++    if l % 7 == 0:
++        print(f"  layer {l} awq alphas attn {a1:.2f} mlp {a2:.2f} down {a3:.2f} o {a4:.2f}", flush=True)
++
++    quant = {}
++    for key, names in LINEARS.items():
++        for n in names:
++            quant[f"{PARENT[n]}.{n}.weight"] = gptq(W[n], Hs[key])
++    return quant, {"input_layernorm.weight": ln1, "post_attention_layernorm.weight": ln2}
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("tts_dir", type=Path)
++    ap.add_argument("calib", type=Path)
++    ap.add_argument("out", type=Path)
++    ap.add_argument("--threads", type=int, default=8)
++    a = ap.parse_args()
++    assert a.out.name == "Qwen3-1.7B-NPU2", a.out
++    torch.set_num_threads(a.threads)
++    sub = json.loads((a.tts_dir / "config.json").read_text())["talker_config"]
++    L, D = sub["num_hidden_layers"], sub["hidden_size"]
++    nh, nkv, hd = sub["num_attention_heads"], sub["num_key_value_heads"], sub["head_dim"]
++    f = safe_open(a.tts_dir / "model.safetensors", "pt")
++    get = lambda k: f.get_tensor(k).float()  # noqa: E731
++
++    tensors = {"model.embed_tokens.weight": torch.zeros(VOCAB, D)}
++    t0 = time.time()
++    for l in range(L):
++        quant, norms = quantize_layer(get, a.calib, l, nh, nkv, hd)
++        p = f"talker.model.layers.{l}."
++        for n in ("self_attn.q_norm.weight", "self_attn.k_norm.weight"):
++            tensors[f"model.layers.{l}.{n}"] = f.get_tensor(p + n)
++        for n, w in norms.items():
++            tensors[f"model.layers.{l}.{n}"] = w
++        for n in PARENT:
++            name = f"{PARENT[n]}.{n}.weight"
++            tensors[f"model.layers.{l}.{name}"] = q4nx.pack(*quant[name])
++        print(f"layer {l} done ({time.time() - t0:.0f}s)", flush=True)
++    tensors["model.norm.weight"] = f.get_tensor("talker.model.norm.weight")
++    tensors["lm_head.weight"] = q4nx.identity_head(VOCAB, D)
++    a.out.mkdir(parents=True, exist_ok=True)
++    q4nx.write(a.out / "model.q4nx", tensors)
++    q4nx.write_config(HERE / "configs/Qwen3-1.7B-NPU2.json", sub, VOCAB, a.out / "config.json")
++    print("wrote", a.out)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/tools/qwen3_tts/requirements.txt b/src/tools/qwen3_tts/requirements.txt
+new file mode 100644
+index 00000000..8898ed74
+--- /dev/null
++++ b/src/tools/qwen3_tts/requirements.txt
+@@ -0,0 +1,95 @@
++# Python environment for src/tools/qwen3_tts (Python 3.12, CPU only).
++# Exact versions of everything the build imports, plus their full dependency closure,
++# as used to build and validate the reference package. qwen-tts 0.1.1 is the PyPI release
++# (https://github.com/Qwen/Qwen3-TTS); it pins transformers==4.57.3.
++#   uv:  uv pip install --index-strategy unsafe-best-match -r requirements.txt
++#   pip: pip install -r requirements.txt
++--extra-index-url https://download.pytorch.org/whl/cpu
++accelerate==1.12.0
++annotated-doc==0.0.5
++annotated-types==0.8.0
++anyio==4.15.1
++brotli==1.2.0
++certifi==2026.7.22
++cffi==2.1.1
++charset-normalizer==3.5.2
++click==8.5.0
++cloudpickle==3.1.2
++decorator==5.3.1
++einops==0.8.2
++fastapi==0.143.3
++filelock==3.32.3
++flatbuffers==25.12.19
++fsspec==2026.7.0
++gradio==6.17.3
++gradio-client==2.5.0
++groovy==0.1.2
++h11==0.16.0
++hf-gradio==0.4.1
++hf-xet==1.7.0
++httpcore==1.0.9
++httpx==0.28.1
++huggingface-hub==0.36.2
++idna==3.20
++jinja2==3.1.6
++joblib==1.6.0
++lazy-loader==0.6
++librosa==1.0.0
++llvmlite==0.50.0
++markdown-it-py==4.2.0
++markupsafe==3.0.3
++mdurl==0.1.2
++mpmath==1.3.0
++msgpack==1.2.3
++narwhals==2.27.1
++networkx==3.6.1
++numba==0.68.0
++numpy==2.5.4
++onnxruntime==1.31.0
++opentelemetry-api==1.45.1
++orjson==3.13.0
++packaging==26.3
++pandas==3.0.6
++pillow==12.3.0
++platformdirs==4.13.4
++pooch==1.9.0
++protobuf==7.36.2
++psutil==7.2.2
++pycparser==3.11
++pydantic==2.14.1
++pydantic-core==2.50.1
++pydub==0.25.1
++pygments==2.21.0
++python-dateutil==2.9.0.post0
++python-multipart==0.0.32
++pytz==2026.5
++pyyaml==6.0.3
++qwen-tts==0.1.1
++regex==2026.9.29
++requests==2.34.2
++rich==15.0.0
++safehttpx==0.1.7
++safetensors==0.8.0
++scikit-learn==1.9.1
++scipy==1.18.1
++semantic-version==2.10.0
++setuptools==78.1.0
++shellingham==1.5.4
++six==1.17.0
++soundfile==0.14.0
++sox==1.5.0
++soxr==1.1.0
++starlette==1.8.0
++sympy==1.14.0
++threadpoolctl==3.7.0
++tokenizers==0.22.2
++tomlkit==0.14.0
++torch==2.14.1+cpu
++torchaudio==2.11.0+cpu
++tqdm==4.70.1
++transformers==4.57.3
++typer==0.27.3
++typing-extensions==4.16.0
++typing-inspection==0.4.4
++urllib3==2.8.0
++uvicorn==0.54.0
+diff --git a/src/tools/qwen3_tts/trim_host.py b/src/tools/qwen3_tts/trim_host.py
+new file mode 100644
+index 00000000..3475455f
+--- /dev/null
++++ b/src/tools/qwen3_tts/trim_host.py
+@@ -0,0 +1,34 @@
++"""Extract the host-side talker tensors (everything the NPU engines do not hold).
++
++usage: trim_host.py <tts_dir> <out.safetensors>
++
++Keeps every talker.* tensor of model.safetensors except the transformer layers
++(talker.model.layers.*, talker.code_predictor.model.layers.*), which live in the Q4NX
++packages: codec/text embeddings, text projection, final norms, codec_head and the
++code predictor's embeddings, projection and heads. Dtypes are unchanged (BF16).
++"""
++import argparse
++from pathlib import Path
++
++from safetensors import safe_open
++from safetensors.torch import save_file
++
++DROP = ("talker.model.layers.", "talker.code_predictor.model.layers.")
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("tts_dir", type=Path)
++    ap.add_argument("out", type=Path)
++    a = ap.parse_args()
++    tensors = {}
++    with safe_open(a.tts_dir / "model.safetensors", "pt") as f:
++        for k in sorted(f.keys()):
++            if k.startswith("talker.") and not k.startswith(DROP):
++                tensors[k] = f.get_tensor(k).contiguous()
++    save_file(tensors, a.out, metadata={"format": "pt"})
++    print(f"wrote {a.out}: {len(tensors)} tensors, {sum(t.numel() for t in tensors.values()) / 1e6:.1f}M params")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/tools/qwen3_tts/tts_client.py b/src/tools/qwen3_tts/tts_client.py
+new file mode 100644
+index 00000000..9d0ea743
+--- /dev/null
++++ b/src/tools/qwen3_tts/tts_client.py
+@@ -0,0 +1,212 @@
++"""Client for FLM's text-to-speech endpoints: speak text, stream text, or speak LLM output.
++
++usage:
++  tts_client.py speak "text" [-o out.wav] [--voice V] [--language L]
++      POST /v1/audio/speech with streamed audio; reports time to first audio
++  tts_client.py stream (--text T | --file F) [--chunk 4 --rate 40] [-o out.wav]
++      WebSocket /v1/audio/speech/stream; feeds the text in --chunk characters at --rate
++      chunks/s (an LLM-like text stream)
++  tts_client.py llm --prompt P --llm-url URL --llm-model M [--paced] [-o out.wav]
++      streams an OpenAI-compatible chat completion into the WebSocket. --paced keeps the
++      text lead (the server's "lead" events) near --min-lead tokens by asking the LLM for
++      one sentence at a time, instead of streaming the whole reply at once.
++      The LLM key is read from $LLM_API_KEY; --llm-extra adds JSON to the request body
++      (e.g. '{"chat_template_kwargs": {"enable_thinking": false}}').
++common: --server http://127.0.0.1:52625  --cancel-after S (send input.cancel after S s)
++Reports: time to first audio, playback underruns (audio that would arrive after the
++player needed it, playback starting at the first chunk), cancel latency, server metrics.
++Needs: websockets (pip install websockets==15.0.1); everything else is the standard library.
++"""
++import argparse, asyncio, json, os, struct, sys, time, urllib.request, wave
++
++RATE = 24000
++
++
++def save_wav(path, pcm: bytes):
++    with wave.open(path, "wb") as w:
++        w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE); w.writeframes(pcm)
++
++
++class Playback:
++    """virtual player: starts at the first chunk and plays continuously"""
++    def __init__(self):
++        self.t0 = None; self.samples = 0; self.underruns = 0; self.worst_late = 0.0; self.first = None
++
++    def chunk(self, n_bytes, now):
++        if self.t0 is None:
++            self.t0 = now; self.first = now
++        due = self.t0 + self.samples / RATE
++        if now > due + 0.005:
++            self.underruns += 1; self.worst_late = max(self.worst_late, now - due)
++            self.t0 += now - due            # the player stalls, then continues
++        self.samples += n_bytes // 2
++
++
++def cmd_speak(a):
++    body = {"input": a.text, "voice": a.voice, "language": a.language, "response_format": "wav",
++            "stream": True, "stream_format": "audio"}
++    if a.seed: body["seed"] = a.seed
++    req = urllib.request.Request(a.server + "/v1/audio/speech", data=json.dumps(body).encode(),
++                                 headers={"Content-Type": "application/json"})
++    t0 = time.time(); first = None; data = b""; pb = Playback()
++    with urllib.request.urlopen(req) as r:
++        while True:
++            b = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
++            if not b: break
++            now = time.time()
++            if first is None: first = now
++            data += b
++            pb.chunk(len(b), now)
++    pcm = data[44:]
++    save_wav(a.output, pcm)
++    print(json.dumps({"audio_s": len(pcm) / 2 / RATE, "first_audio_ms": round(1000 * (first - t0)) if first else None,
++                      "underruns": pb.underruns, "worst_late_ms": round(1000 * pb.worst_late), "out": a.output}))
++
++
++async def ws_session(a, feeder):
++    import websockets
++    url = a.server.replace("http", "ws", 1) + "/v1/audio/speech/stream"
++    pcm = bytearray(); pb = Playback(); events = []; t_cancel = None; t_last_audio = None
++    async with websockets.connect(url, max_size=None) as ws:
++        cfg = {"type": "session.config", "voice": a.voice, "language": a.language}
++        if a.seed: cfg["seed"] = a.seed
++        await ws.send(json.dumps(cfg))
++        state = {"lead": 0, "t_first_text": None, "done": False}
++
++        async def reader():
++            nonlocal t_last_audio
++            async for msg in ws:
++                now = time.time()
++                if isinstance(msg, bytes):
++                    pcm.extend(msg); pb.chunk(len(msg), now); t_last_audio = now
++                    continue
++                e = json.loads(msg)
++                if e["type"] == "lead": state["lead"] = e["lead"]
++                elif e["type"] in ("segment", "audio.done", "error", "audio.start"): events.append(e)
++                if e["type"] == "error": print("server error:", e.get("message"), file=sys.stderr)
++                if e["type"] == "session.done":
++                    state["done"] = True
++                    return
++
++        async def canceller():
++            nonlocal t_cancel
++            await asyncio.sleep(a.cancel_after)
++            t_cancel = time.time()
++            await ws.send(json.dumps({"type": "input.cancel"}))
++
++        rd = asyncio.create_task(reader())
++        tasks = [asyncio.create_task(canceller())] if a.cancel_after else []
++        await feeder(ws, state)
++        await ws.send(json.dumps({"type": "input.done"}))
++        await rd
++        for t in tasks: t.cancel()
++        await ws.send(json.dumps({"type": "session.close"}))
++    done = next((e for e in events if e["type"] == "audio.done"), {})
++    m = done.get("metrics") or {}
++    out = {"audio_s": round(len(pcm) / 2 / RATE, 2), "status": done.get("status"),
++           "first_audio_from_first_text_ms": round(1000 * (pb.first - state["t_first_text"])) if pb.first and state["t_first_text"] else None,
++           "underruns": pb.underruns, "worst_late_ms": round(1000 * pb.worst_late),
++           "segments": m.get("segments"), "retries": m.get("retries"), "server_ttfa_ms": m.get("ttfa_ms"),
++           "frame_ms_mean": m.get("frame_ms_mean"), "frame_ms_p99": m.get("frame_ms_p99"), "out": a.output}
++    if t_cancel:
++        out["cancel_to_last_audio_ms"] = round(1000 * ((t_last_audio or t_cancel) - t_cancel))
++    save_wav(a.output, bytes(pcm))
++    if a.events:
++        with open(a.events, "w") as f:
++            json.dump({"summary": out, "events": events, "metrics": m}, f, ensure_ascii=False, indent=1)
++    print(json.dumps(out, ensure_ascii=False))
++
++
++def cmd_stream(a):
++    text = a.text if a.text is not None else open(a.file, encoding="utf-8").read()
++
++    async def feeder(ws, state):
++        state["t_first_text"] = time.time()
++        for i in range(0, len(text), a.chunk):
++            await ws.send(json.dumps({"type": "input.text", "text": text[i:i + a.chunk]}))
++            await asyncio.sleep(1.0 / a.rate)
++    asyncio.run(ws_session(a, feeder))
++
++
++def llm_stream(a, messages, max_tokens):
++    """yield content deltas of a streamed chat completion (blocking; run in a thread)"""
++    body = {"model": a.llm_model, "messages": messages, "stream": True, "max_tokens": max_tokens}
++    if a.llm_extra: body.update(json.loads(a.llm_extra))
++    req = urllib.request.Request(a.llm_url.rstrip("/") + "/chat/completions", data=json.dumps(body).encode(),
++                                 headers={"Content-Type": "application/json",
++                                          "Authorization": "Bearer " + os.environ.get("LLM_API_KEY", "")})
++    with urllib.request.urlopen(req) as r:
++        for line in r:
++            line = line.decode("utf-8").strip()
++            if not line.startswith("data:") or line == "data: [DONE]": continue
++            d = json.loads(line[5:])
++            if d.get("choices") and d["choices"][0].get("delta", {}).get("content"):
++                yield d["choices"][0]["delta"]["content"]
++
++
++def cmd_llm(a):
++    system = a.system or ("あなたは親切な日本語のアシスタントです。音声で読み上げられるので、記号や箇条書きを使わず、"
++                          "自然な話し言葉の文章だけで答えてください。")
++    messages = [{"role": "system", "content": system}, {"role": "user", "content": a.prompt}]
++
++    async def feeder(ws, state):
++        loop = asyncio.get_running_loop()
++        q = asyncio.Queue()
++
++        def pump(msgs, max_tokens):
++            for d in llm_stream(a, msgs, max_tokens): loop.call_soon_threadsafe(q.put_nowait, d)
++            loop.call_soon_threadsafe(q.put_nowait, None)
++
++        reply = ""
++        for turn in range(a.max_requests if a.paced else 1):
++            if a.paced and turn:
++                # next sentence only when the text lead runs low
++                while state["lead"] >= a.min_lead and not state["done"]: await asyncio.sleep(0.02)
++                msgs = messages + [{"role": "assistant", "content": reply},
++                                   {"role": "user", "content": "続けてください。次の一文だけを話してください。"}]
++            else:
++                msgs = messages
++            loop.run_in_executor(None, pump, msgs, a.sentence_tokens if a.paced else a.max_tokens)
++            got = ""
++            while True:
++                d = await q.get()
++                if d is None: break
++                if state["t_first_text"] is None: state["t_first_text"] = time.time()
++                got += d
++                state["lead"] += 1   # until the server's next lead event
++                await ws.send(json.dumps({"type": "input.text", "text": d}))
++            reply += got
++            if not got: break
++    asyncio.run(ws_session(a, feeder))
++
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    sub = p.add_subparsers(dest="cmd", required=True)
++    for name in ("speak", "stream", "llm"):
++        s = sub.add_parser(name)
++        s.add_argument("--server", default="http://127.0.0.1:52625")
++        s.add_argument("--voice", default="ono_anna")
++        s.add_argument("--language", default="")
++        s.add_argument("--seed", type=int, default=0)
++        s.add_argument("-o", "--output", default="out.wav")
++        s.add_argument("--events", default="", help="write events and metrics to this JSON file")
++        s.add_argument("--cancel-after", type=float, default=0.0)
++        if name == "speak":
++            s.add_argument("text")
++        if name == "stream":
++            s.add_argument("--text"); s.add_argument("--file")
++            s.add_argument("--chunk", type=int, default=4); s.add_argument("--rate", type=float, default=40.0)
++        if name == "llm":
++            s.add_argument("--prompt", required=True); s.add_argument("--system", default="")
++            s.add_argument("--llm-url", required=True); s.add_argument("--llm-model", required=True)
++            s.add_argument("--llm-extra", default="")
++            s.add_argument("--paced", action="store_true"); s.add_argument("--min-lead", type=int, default=8)
++            s.add_argument("--sentence-tokens", type=int, default=40); s.add_argument("--max-requests", type=int, default=12)
++            s.add_argument("--max-tokens", type=int, default=400)
++    a = p.parse_args()
++    {"speak": cmd_speak, "stream": cmd_stream, "llm": cmd_llm}[a.cmd](a)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/tools/qwen3_tts/write_package_json.py b/src/tools/qwen3_tts/write_package_json.py
+new file mode 100644
+index 00000000..b5dd7b38
+--- /dev/null
++++ b/src/tools/qwen3_tts/write_package_json.py
+@@ -0,0 +1,48 @@
++"""Write package.json, the provenance record of a Qwen3-TTS NPU model package.
++
++usage: write_package_json.py <tts_dir> <package_dir> [--repo Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice]
++                             [--revision <commit>] [--sha256 <model.safetensors sha256>]
++                             [--detector detector.json]
++
++--sha256 skips hashing the 3.8 GB checkpoint when the caller already has the digest.
++The garble detector's settings (with their reason and calibration record) come from
++detector.json next to this script; flm reads them from package.json at load.
++calibrate_entropy.py replaces them after a recalibration.
++"""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++TOOLS_VERSION = "1"
++
++
++def sha256(path, chunk=1 << 24):
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while b := f.read(chunk):
++            h.update(b)
++    return h.hexdigest()
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("tts_dir", type=Path)
++    ap.add_argument("package_dir", type=Path)
++    ap.add_argument("--repo", default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
++    ap.add_argument("--revision", default=None)
++    ap.add_argument("--sha256", default=None)
++    ap.add_argument("--detector", type=Path, default=Path(__file__).resolve().parent / "detector.json")
++    a = ap.parse_args()
++    source = {"repo": a.repo}
++    if a.revision:
++        source["revision"] = a.revision
++    source["model_safetensors_sha256"] = a.sha256 or sha256(a.tts_dir / "model.safetensors")
++    pkg = {"format": 1, "source": source, "talker_quant": "awq_gptq", "tools_version": TOOLS_VERSION,
++           "detector": json.loads(a.detector.read_text())}
++    (a.package_dir / "package.json").write_text(json.dumps(pkg, indent=2, ensure_ascii=False) + "\n")
++    print("wrote", a.package_dir / "package.json")
++
++
++if __name__ == "__main__":
++    main()

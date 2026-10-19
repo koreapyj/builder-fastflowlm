@@ -1,0 +1,3 @@
+# upstream workflow files the generated ones were made from (paths in the upstream tree)
+86faac53fb80dd283395a88b460f7f1b314886645d3cf0f59f86c181ceaa4d0c  .github/workflows/ubuntu-build.yml
+996feb92df900d9197a110d7b483728ada4ced02841d407bc13e0930eb8e32bb  .github/workflows/debian-portable.yml

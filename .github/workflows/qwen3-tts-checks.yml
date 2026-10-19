@@ -1,0 +1,58 @@
+# Checks of this repository's own (not generated from upstream).
+name: Qwen3-TTS checks
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+    paths-ignore:
+      - '**/*.md'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  patches:
+    name: Patches apply independently
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+        with:
+          path: .builder
+
+      - name: Upstream FastFlowLM at FLM_REF, unpatched
+        env:
+          NO_PATCHES: 1
+        run: .builder/support/prepare-source.sh flm
+
+      - name: Each patch alone, and all in reverse order
+        run: |
+          set -eu
+          for p in .builder/patches/*.patch; do
+            git -C flm apply --check "$GITHUB_WORKSPACE/$p"
+            echo "ok alone: $(basename "$p")"
+          done
+          for p in $(ls .builder/patches/*.patch | sort -r); do
+            git -C flm apply "$GITHUB_WORKSPACE/$p"
+          done
+          echo "ok all, reverse order"
+
+  text-tests:
+    name: Text segmentation tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+        with:
+          path: .builder
+
+      - name: Prepare FastFlowLM source (upstream at FLM_REF + patches)
+        run: .builder/support/prepare-source.sh flm
+
+      - name: Build and run
+        run: |
+          cmake -S flm/src/test/qwen3_tts -B build-tts-test
+          cmake --build build-tts-test
+          ./build-tts-test/test_tts_text

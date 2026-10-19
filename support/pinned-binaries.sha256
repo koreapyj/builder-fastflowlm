@@ -1,0 +1,17 @@
+# Prebuilt engine libraries and xclbins the Qwen3-TTS fast path was validated against.
+# The integration drives qwen3_npu through interposed XRT calls and depends on its
+# internals; prepare-source.sh refuses to continue if any of these differ at FLM_REF.
+1a3ee945bbbdfdecd2a2bfc90a5c5d29e2df8fc4d63f3d67dcc9a83cbc5dd547  src/lib/xrt/libqwen3_npu.so
+58666857753dae8c4e52bebea2063d09fed56971e43b67040f758cc9855dd136  src/lib/xrt/libq4_npu_eXpress.so
+35b41c0754dff57eefe9c0ddbddfc65151f11769458a4437f4700f2f1973dc81  src/lib/xrt/libmha.so
+c89ae39e7fe76e7ef8c3e0cdb5141311b6b43dd3b624ec8bb195a6a91e6d6f58  src/lib/xrt/libdequant.so
+4edc9b8ad41059ced21d0b21ce08214fdc784fe4057aa667c10995d1177dad67  src/lib/xrt/libgemm.so
+ed5d6e230ec184a47922b9ee540e7248160488f9e9efab411cf0e6e8f91fd0f4  src/lib/xrt/liblm_head.so
+88ad573eb558881a8b43117dc8fbb6a0726f381940a00ad941d064e098ab0c65  src/xclbins/Qwen3-1.7B-NPU2/attn.xclbin
+575d45e47993315f95f601e07f9f21164f30515f80e232e16255d7c5f2a1d4bf  src/xclbins/Qwen3-1.7B-NPU2/dequant.xclbin
+3f86d2c3fafad2c540db01673c9d3ddb6093012b1ce85fb53d39c26a7a6bc925  src/xclbins/Qwen3-1.7B-NPU2/layer.xclbin
+4afc2a6f2459c0ddcf7de61193a6e83e53a951a0f6c33521456d569bab2c7142  src/xclbins/Qwen3-1.7B-NPU2/mm.xclbin
+88ad573eb558881a8b43117dc8fbb6a0726f381940a00ad941d064e098ab0c65  src/xclbins/Qwen3-0.6B-NPU2/attn.xclbin
+575d45e47993315f95f601e07f9f21164f30515f80e232e16255d7c5f2a1d4bf  src/xclbins/Qwen3-0.6B-NPU2/dequant.xclbin
+9e084785df7c4e37bc4c0de7ab1635c2cd3a18114a319494889d30362e0e6178  src/xclbins/Qwen3-0.6B-NPU2/layer.xclbin
+4afc2a6f2459c0ddcf7de61193a6e83e53a951a0f6c33521456d569bab2c7142  src/xclbins/Qwen3-0.6B-NPU2/mm.xclbin

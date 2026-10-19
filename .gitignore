@@ -1,0 +1,9 @@
+# upstream FastFlowLM checkout (make prepare)
+/src/
+# scratch
+/.tmp/
+/.claude/
+# local build outputs
+/*.deb
+/*.buildinfo
+/*.changes
