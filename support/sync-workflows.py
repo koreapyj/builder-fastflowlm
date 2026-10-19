@@ -5,11 +5,13 @@ usage: support/sync-workflows.py [<upstream tree>]   (default: ./src, prepared a
 
 CI follows upstream: the build jobs are upstream's (.github/workflows/ubuntu-build.yml and
 debian-portable.yml at FLM_REF), with only these changes:
-  - triggers: every branch push, v* tags, pull requests, manual runs
+  - triggers: every branch push, pull requests, manual runs (no tags of our own)
   - every actions/checkout step becomes: check this repository out into .builder/, then
     support/prepare-source.sh puts upstream FastFlowLM at FLM_REF (with our patches) in the
     workspace root, where upstream's steps expect their source
   - versions: `git describe` of upstream plus +g<this repository's commit>
+  - releases: upstream releases when it pushes a tag; here every push to the default
+    branch releases, tagged with upstream's version: <FLM_DESCRIBE>+g<commit>
 Upstream's Windows workflows run on upstream's self-hosted runners and are not mirrored.
 The hashes of the upstream files are recorded in support/upstream-workflows.sha256;
 prepare-source.sh warns when FLM_REF's workflows no longer match (re-run this script).
@@ -24,8 +26,6 @@ TRIGGERS = """on:
   push:
     branches:
       - '**'
-    tags:
-      - 'v*'
     paths-ignore:
       - '**/*.md'
   pull_request:
@@ -45,6 +45,54 @@ def checkout_steps(indent):
         f"{p}  shell: bash",
         f"{p}  run: .builder/support/prepare-source.sh \"$GITHUB_WORKSPACE\"",
     ]
+
+
+RELEASE_IF = "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+
+
+def release_tag_step(p):
+    return [
+        f"{p}- name: Release tag",
+        f"{p}  id: release_tag",
+        f"{p}  shell: bash",
+        f"{p}  run: |",
+        f"{p}    source .builder/support/upstream.env",
+        f"{p}    echo \"tag=$FLM_DESCRIBE+g${{GITHUB_SHA::7}}\" >> \"$GITHUB_OUTPUT\"",
+        "",
+    ]
+
+
+def releases(lines):
+    """jobs gated on a tag push: also run on default-branch pushes, upload to release_tag"""
+    out, i, n = [], 0, 0
+    while i < len(lines):
+        out.append(lines[i])
+        if re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[i]):          # a job
+            j = i + 1
+            while j < len(lines) and not re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[j]) and not re.match(r"^\S", lines[j]):
+                j += 1
+            job = lines[i + 1:j]
+            if any(l.strip() == "if: github.ref_type == 'tag'" for l in job):
+                n += 1
+                has_builder = any("path: .builder" in l for l in job)
+                k = 0
+                while k < len(job):
+                    l = job[k]
+                    if l.strip() == "if: github.ref_type == 'tag'":
+                        l = l.replace("github.ref_type == 'tag'", RELEASE_IF)
+                    l = l.replace("tag: ${{ github.ref }}", "tag: ${{ steps.release_tag.outputs.tag }}")
+                    out.append(l)
+                    if l.strip() == "steps:" and not has_builder:
+                        p = " " * (len(job[k + 1]) - len(job[k + 1].lstrip()))
+                        out += checkout_steps(len(p))[:4] + [""] + release_tag_step(p)
+                    if has_builder and "prepare-source.sh" in l:
+                        p = " " * (len(l) - len(l.lstrip()) - 2)
+                        out += [""] + release_tag_step(p)[:-1]
+                    k += 1
+                i = j
+                continue
+        i += 1
+    return out, n
 
 
 def transform(text, name, ref):
@@ -82,6 +130,9 @@ def transform(text, name, ref):
                 continue
         out.append(lines[i])
         i += 1
+    out, n_rel = releases(out)
+    if n_rel == 0:
+        sys.exit(f"{name}: no tag-gated release job found; upstream changed shape, update this script")
     text = "\n".join(out) + "\n"
     # versions: upstream's git describe plus this repository's commit
     text, n_ver = re.subn(r"git describe --tags --always",

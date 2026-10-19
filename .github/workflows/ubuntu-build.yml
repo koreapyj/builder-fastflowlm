@@ -6,8 +6,6 @@ on:
   push:
     branches:
       - '**'
-    tags:
-      - 'v*'
     paths-ignore:
       - '**/*.md'
   pull_request:
@@ -112,7 +110,7 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     needs: package-deb
-    if: github.ref_type == 'tag'
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     steps:
       - name: Checkout builder
         uses: actions/checkout@v4
@@ -122,6 +120,13 @@ jobs:
       - name: Prepare FastFlowLM source (upstream at FLM_REF + patches)
         shell: bash
         run: .builder/support/prepare-source.sh "$GITHUB_WORKSPACE"
+
+      - name: Release tag
+        id: release_tag
+        shell: bash
+        run: |
+          source .builder/support/upstream.env
+          echo "tag=$FLM_DESCRIBE+g${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Get version from git describe
         id: get_version
@@ -139,7 +144,7 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ github.ref }}
+          tag: ${{ steps.release_tag.outputs.tag }}
           file_glob: true
           file: debs/*/*.deb
           overwrite: true

@@ -26,14 +26,15 @@ FLM_REF="${FLM_REF_OVERRIDE:-$FLM_REF}"
 
 mkdir -p "$dir"
 cd "$dir"
+# CI containers run as root on a workspace owned by another uid: git refuses to work in
+# it (and in the submodules it creates) until told it is safe. Before any git command.
+if [ -n "${CI:-}" ]; then git config --global --add safe.directory '*'; fi
 if [ ! -d .git ]; then
     # init + fetch instead of clone: <dir> may be non-empty (CI checks this repository
     # out into a subdirectory of the workspace the upstream tree goes to)
     git init -q
     git remote add origin "$FLM_REPO"
 fi
-# CI containers run as root on a workspace owned by another uid
-[ -n "${CI:-}" ] && git config --global --add safe.directory "$PWD"
 if git rev-parse -q --verify HEAD >/dev/null && ! git diff --quiet HEAD --; then
     echo "prepare-source: $dir has local changes; not touching the checkout" >&2
 else
@@ -42,7 +43,13 @@ else
     git fetch -q origin "$FLM_REF"
     git -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
 fi
-echo "prepare-source: upstream is $(git describe --tags --always)"
+describe="$(git describe --tags --always)"
+echo "prepare-source: upstream is $describe"
+if [ -z "${FLM_REF_OVERRIDE:-}" ] && [ "$describe" != "$FLM_DESCRIBE" ]; then
+    echo "prepare-source: upstream describes as $describe, support/upstream.env says FLM_DESCRIBE=$FLM_DESCRIBE;" >&2
+    echo "update FLM_DESCRIBE (release tags and package versions are derived from it)" >&2
+    exit 1
+fi
 if ! grep -v '^#' "$here/upstream-workflows.sha256" | sha256sum --quiet -c - >/dev/null 2>&1; then
     msg="upstream build workflows at $FLM_REF differ from the ones .github/workflows was generated from; run support/sync-workflows.py"
     if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::warning::$msg"; else echo "prepare-source: warning: $msg" >&2; fi
