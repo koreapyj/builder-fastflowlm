@@ -7,6 +7,9 @@ calibrates the detector's entropy threshold on the NPU; test client for the
 speech endpoints; README (build, run, API, limitations).
 Python only; nothing here is built or installed by CMake.
 
+SPDX-License-Identifier: GPL-3.0-or-later WITH GPL-3.0-linking-exception
+Copyright (C) 2026 Yoonji Park <koreapyj@dcmys.kr>
+
 diff --git a/src/tools/qwen3_tts/README.md b/src/tools/qwen3_tts/README.md
 new file mode 100644
 index 00000000..682368ec

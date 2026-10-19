@@ -21,6 +21,9 @@ everything else on the CPU (embeddings, heads, sampling, 24 kHz speech decoder).
 
 The model package is built with the tools in the qwen3-tts-package-tools patch.
 
+SPDX-License-Identifier: GPL-3.0-or-later WITH GPL-3.0-linking-exception
+Copyright (C) 2026 Yoonji Park <koreapyj@dcmys.kr>
+
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index bb75b7f1..9cc01ebd 100644
 --- a/src/CMakeLists.txt

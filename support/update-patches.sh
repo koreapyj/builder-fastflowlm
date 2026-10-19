@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later WITH GPL-3.0-linking-exception
+# Copyright (C) 2026 Yoonji Park <koreapyj@dcmys.kr>
 #
 # Regenerate patches/*.patch from the working tree of an upstream checkout.
 #

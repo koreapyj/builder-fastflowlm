@@ -57,3 +57,11 @@ make check          # each patch applies alone to a clean FLM_REF
 1. Set `FLM_REF` and `FLM_DESCRIBE` (its `git describe --tags --always`) in `support/upstream.env` (a tag or a commit), `make prepare` (in a fresh `./src`, or one without local changes) and fix any patch that no longer applies; `make update`, `make check`.
 2. If `prepare` reports different engine binaries: the integration has to be revalidated on the NPU before the new ref can be used (the fast path harvests the engine's instruction streams and buffer layout); then update `support/pinned-binaries.sha256`.
 3. `make sync-workflows` regenerates the CI from upstream's workflows at the new ref (`prepare` warns when they changed).
+
+## License
+
+The files of this repository (`patches/`, `support/`, `Makefile`, `.github/workflows/`) are licensed under the GNU General Public License v3.0 or later, with an additional permission (GPL-3.0 section 7) to link or combine them with the FastFlowLM prebuilt NPU engine libraries and NPU kernel binaries (xclbin), which are covered by the FastFlowLM NPU Binary License. See [LICENSE](LICENSE).
+
+`SPDX-License-Identifier: GPL-3.0-or-later WITH GPL-3.0-linking-exception`
+
+Upstream FastFlowLM keeps its own licenses for its parts: its source code is under the MIT License (`LICENSE_RUNTIME.txt`) and its NPU binaries under the FastFlowLM NPU Binary License (`LICENSE_BINARY.txt`). The workflows in `.github/workflows/` other than `qwen3-tts-checks.yml` are generated from upstream's MIT-licensed workflows; only the changes are under this repository's license.

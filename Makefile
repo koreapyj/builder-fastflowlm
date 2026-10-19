@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later WITH GPL-3.0-linking-exception
+# Copyright (C) 2026 Yoonji Park <koreapyj@dcmys.kr>
 # Local workflow for developing the patches; CI does not use it (see .github/workflows).
 # Builds run in upstream FastFlowLM's own CI image (plus Rust), like CI.
 

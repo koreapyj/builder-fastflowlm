@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later WITH GPL-3.0-linking-exception
+# Copyright (C) 2026 Yoonji Park <koreapyj@dcmys.kr>
 # Local builder image: upstream FastFlowLM's own CI build environment plus what its CI
 # installs on top in every run (Rust toolchain, libedit-dev), baked in once.
 # Used by the Makefile; CI uses the upstream image directly, as upstream does.

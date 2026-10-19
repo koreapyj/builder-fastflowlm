@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later WITH GPL-3.0-linking-exception
+# Copyright (C) 2026 Yoonji Park <koreapyj@dcmys.kr>
 # Checks of this repository's own (not generated from upstream).
 name: Qwen3-TTS checks
 
