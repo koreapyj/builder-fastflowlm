@@ -4236,10 +4236,10 @@ index 8d3d39d4..00393209 100644
  // Forward declarations
 diff --git a/src/server/tts_service.cpp b/src/server/tts_service.cpp
 new file mode 100644
-index 00000000..d10463bb
+index 00000000..ad06353a
 --- /dev/null
 +++ b/src/server/tts_service.cpp
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,541 @@
 +/*!
 + * \file tts_service.cpp
 + * \brief Text-to-speech endpoints (see tts_service.hpp)
@@ -4358,15 +4358,17 @@ index 00000000..d10463bb
 +
 +// Cancel callbacks run under mu_: end_utterance() takes mu_ too, so a callback never runs
 +// after its utterance has ended (and its state is gone). They only set flags.
-+bool TtsService::begin_utterance(bool replace, std::function<void()> cancel, uint64_t* id) {
++bool TtsService::begin_utterance(bool replace, std::function<void()> cancel, uint64_t* id,
++                                 std::function<bool()> ending) {
 +    std::lock_guard<std::mutex> l(mu_);
-+    if (active_id_ != 0) {
++    if (active_id_ != 0 && !(active_ending_ && active_ending_())) {
 +        if (!replace) return false;
 +        if (active_cancel_) active_cancel_();
 +    }
 +    *id = next_id_++;
 +    active_id_ = *id;
 +    active_cancel_ = std::move(cancel);
++    active_ending_ = std::move(ending);
 +    return true;
 +}
 +
@@ -4375,12 +4377,15 @@ index 00000000..d10463bb
 +    if (active_id_ == id) {
 +        active_id_ = 0;
 +        active_cancel_ = nullptr;
++        active_ending_ = nullptr;
 +    }
 +}
 +
 +bool TtsService::busy() const {
++    // an utterance whose client is gone (or that was cancelled) stops within a frame; a new
++    // request is not refused for it but waits for the NPU like any other request
 +    std::lock_guard<std::mutex> l(mu_);
-+    return active_id_ != 0;
++    return active_id_ != 0 && !(active_ending_ && active_ending_());
 +}
 +
 +void TtsService::cancel_active() {
@@ -4501,7 +4506,8 @@ index 00000000..d10463bb
 +        u->index = next_index_++;
 +        u->input = svc_->engine().make_input();
 +        Utterance* up = u.get();
-+        if (!svc_->begin_utterance(replace, [up] { up->cancel = true; up->input->cancel(); }, &u->activity)) {
++        if (!svc_->begin_utterance(replace, [up] { up->cancel = true; up->input->cancel(); }, &u->activity,
++                                   [up] { return up->cancel.load(); })) {
 +            send_json({{"type", "error"}, {"message", "another utterance is being spoken; set replace to cancel it"}});
 +            return false;
 +        }
@@ -4645,10 +4651,12 @@ index 00000000..d10463bb
 +                { send_response(error_json(400, "only speed 1.0 is supported")); return; }
 +            if (j.contains("sample_rate") && j["sample_rate"].is_number_integer() && j["sample_rate"].get<int>() != kRate)
 +                { send_response(error_json(400, "only sample_rate 24000 is supported")); return; }
++            // stream_format (OpenAI): "sse" = speech.audio.delta / speech.audio.done events, "audio" =
++            // raw audio bytes as they are generated. stream: true without a format = sse
++            // (vLLM-Omni). Neither = the whole file at once.
 +            const bool stream = j.value("stream", false);
 +            std::string sfmt = j.contains("stream_format") && j["stream_format"].is_string() ? j["stream_format"].get<std::string>() : "";
 +            if (stream && sfmt.empty()) sfmt = "sse";
-+            if (!stream && !sfmt.empty()) { send_response(error_json(400, "stream_format needs stream: true")); return; }
 +            if (!sfmt.empty() && sfmt != "audio" && sfmt != "sse") { send_response(error_json(400, "stream_format must be audio or sse")); return; }
 +            TtsRequest rq;
 +            const std::string err = parse_tts_fields(j, eng, rq);
@@ -4656,7 +4664,10 @@ index 00000000..d10463bb
 +
 +            std::atomic<bool> cancel{false};
 +            uint64_t act = 0;
-+            self->begin_utterance(true, [&cancel] { cancel = true; }, &act);
++            // a dropped connection cancels the token (disconnect monitor, or a failed write), which
++            // stops generation within a frame and frees the NPU when the handler returns
++            self->begin_utterance(true, [&cancel] { cancel = true; }, &act,
++                                  [&cancel, token] { return cancel.load() || token->cancelled(); });
 +            auto in = eng.make_input();
 +            in->push(text);
 +            in->finish();
@@ -4677,12 +4688,15 @@ index 00000000..d10463bb
 +                    return session->write_raw_chunk(pcm, n * 2);
 +                };
 +            } else if (sfmt == "sse") {
++                // data-only events as OpenAI sends them; each delta is base64 of the next bytes of
++                // the response_format stream (wav: the first one starts with the header)
 +                sink.audio = [&](const int16_t* pcm, size_t n) {
++                    std::string bytes;
++                    if (!started && fmt == "wav") bytes = wav_header(0xFFFFFFFFu);
 +                    started = true;
-+                    json ev = {{"type", "speech.audio.delta"},
-+                               {"audio", base64::to_base64(std::string_view(reinterpret_cast<const char*>(pcm), n * 2))},
-+                               {"response_format", "pcm"}, {"sample_rate", kRate}, {"channels", 1}};
-+                    send_streaming_response("event: speech.audio.delta\ndata: " + ev.dump() + "\n\n", false);
++                    bytes.append(reinterpret_cast<const char*>(pcm), n * 2);
++                    json ev = {{"type", "speech.audio.delta"}, {"audio", base64::to_base64(bytes)}};
++                    send_streaming_response("data: " + ev.dump() + "\n\n", false);
 +                    return !token->cancelled();
 +                };
 +            } else {
@@ -4701,12 +4715,34 @@ index 00000000..d10463bb
 +                return;
 +            }
 +            if (sfmt == "sse") {
-+                if (failed) {
-+                    json ev = {{"type", "speech.audio.error"}, {"error", {{"message", r.message}, {"type", "server_error"}, {"code", r.status == TtsResult::fault ? 503 : 500}}}};
-+                    send_streaming_response("event: speech.audio.error\ndata: " + ev.dump() + "\n\n", true);
-+                } else {
-+                    json ev = {{"type", "speech.audio.done"}, {"usage", {{"output_audio_seconds", r.metrics.value("audio_s", 0.0)}}}, {"metrics", r.metrics}};
-+                    send_streaming_response("event: speech.audio.done\ndata: " + ev.dump() + "\n\n", true);
++                if (!started) {
++                    // nothing streamed yet: a plain HTTP error carries the status
++                    if (failed) { send_response(error_json(r.status == TtsResult::fault ? 503 : 500, r.message)); return; }
++                    if (r.status == TtsResult::cancelled) {
++                        if (!token->cancelled()) send_response(error_json(409, "replaced by another utterance"));
++                        return;
++                    }
++                }
++                if (r.status == TtsResult::ok) {
++                    // usage as OpenAI counts it: text tokens in, audio tokens (12.5 Hz codec frames) out
++                    int in_tok = 0, out_tok = 0;
++                    qwen3_tts::Segment sg;
++                    for (size_t k = 0; in->segment(k, sg); k++) in_tok += sg.total_tokens;
++                    if (r.metrics.contains("segment_log"))
++                        for (const auto& s : r.metrics["segment_log"])
++                            if (s.value("status", "") != "retry") out_tok += s.value("frames", 0);
++                    json ev = {{"type", "speech.audio.done"},
++                               {"usage", {{"input_tokens", in_tok}, {"output_tokens", out_tok}, {"total_tokens", in_tok + out_tok}}}};
++                    send_streaming_response("data: " + ev.dump() + "\n\n", true);
++                } else if (!token->cancelled()) {
++                    // failed or replaced mid-stream; the spec has no error event, so the generic
++                    // OpenAI stream error shape
++                    const bool repl = r.status == TtsResult::cancelled;
++                    json ev = {{"type", "error"},
++                               {"error", {{"type", repl ? "cancelled" : "server_error"},
++                                          {"code", repl ? "replaced" : (r.status == TtsResult::fault ? "npu_fault" : "error")},
++                                          {"message", repl ? "replaced by another utterance" : r.message}}}};
++                    send_streaming_response("data: " + ev.dump() + "\n\n", true);
 +                }
 +                return;
 +            }
@@ -4747,10 +4783,10 @@ index 00000000..d10463bb
 +#endif  // FLM_QWEN3_TTS
 diff --git a/src/server/tts_service.hpp b/src/server/tts_service.hpp
 new file mode 100644
-index 00000000..fe124881
+index 00000000..eb7d9c79
 --- /dev/null
 +++ b/src/server/tts_service.hpp
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,69 @@
 +/*!
 + * \file tts_service.hpp
 + * \brief Text-to-speech endpoints (Qwen3-TTS on the NPU)
@@ -4788,9 +4824,13 @@ index 00000000..fe124881
 +    void register_routes(WebServer& server);
 +
 +    // one utterance at a time across HTTP and WebSocket clients
++    /// \param ending  true once the utterance is winding down (its client is gone or it was
++    ///                cancelled); it then no longer counts as busy
 +    /// \return false if another utterance is active and replace is false
-+    bool begin_utterance(bool replace, std::function<void()> cancel, uint64_t* id);
++    bool begin_utterance(bool replace, std::function<void()> cancel, uint64_t* id,
++                         std::function<bool()> ending = nullptr);
 +    void end_utterance(uint64_t id);
++    /// \brief an utterance is being spoken and is not winding down
 +    bool busy() const;
 +    void cancel_active();
 +
@@ -4805,6 +4845,7 @@ index 00000000..fe124881
 +    mutable std::mutex mu_;
 +    uint64_t active_id_ = 0, next_id_ = 1;
 +    std::function<void()> active_cancel_;
++    std::function<bool()> active_ending_;
 +    // keep-warm: a tiny NPU dispatch every few seconds for a while after each utterance
 +    std::thread warm_;
 +    std::atomic<bool> stop_{false};
