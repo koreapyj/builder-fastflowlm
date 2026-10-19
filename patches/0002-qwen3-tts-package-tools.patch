@@ -12,7 +12,7 @@ Copyright (C) 2026 Yoonji Park <koreapyj@dcmys.kr>
 
 diff --git a/src/tools/qwen3_tts/README.md b/src/tools/qwen3_tts/README.md
 new file mode 100644
-index 00000000..d2058a26
+index 00000000..02d1b3ec
 --- /dev/null
 +++ b/src/tools/qwen3_tts/README.md
 @@ -0,0 +1,272 @@
@@ -186,8 +186,8 @@ index 00000000..d2058a26
 +| `input` | required | text to speak |
 +| `voice` | `ono_anna` | speaker: `vivian`, `serena`, `uncle_fu`, `dylan`, `eric`, `ryan`, `aiden`, `ono_anna`, `sohee` |
 +| `language` | the speaker's own language | `japanese`, `english`, `chinese`, `korean`, ..., or `auto` |
-+| `response_format` | `wav` | `wav` or `pcm` (16-bit little-endian, 24 kHz, mono) |
-+| `stream_format` | none (whole file) | as OpenAI: `audio` streams raw WAV/PCM bytes as they are generated; `sse` streams `data: {"type": "speech.audio.delta", "audio": "<base64>"}` events (base64 of the next bytes in `response_format`; with `wav` the first one starts with the header), then `data: {"type": "speech.audio.done", "usage": {"input_tokens", "output_tokens", "total_tokens"}}` (text tokens in, 12.5 Hz audio tokens out) |
++| `response_format` | `mp3` | as OpenAI: `mp3` (MPEG audio), `opus` (Ogg Opus), `aac` (ADTS), `flac`, `wav`, `pcm` (16-bit little-endian); 24 kHz mono (opus: 48 kHz, as Opus always decodes). The compressed formats are encoded with the FFmpeg `flm` links, so they depend on the build: the `.deb` packages (distro FFmpeg) have all of them; the portable tarballs (LGPL-only FFmpeg) have no `mp3` or `opus` encoder and default to `wav`. `GET /v1/audio/voices` lists what the running build supports |
++| `stream_format` | none (whole file) | as OpenAI: `audio` streams the `response_format` bytes as they are generated; `sse` streams `data: {"type": "speech.audio.delta", "audio": "<base64>"}` events (base64 of the next bytes in `response_format`; with `wav` the first one starts with the header), then `data: {"type": "speech.audio.done", "usage": {"input_tokens", "output_tokens", "total_tokens"}}` (text tokens in, 12.5 Hz audio tokens out) |
 +| `stream` | `false` | `true` without `stream_format`: `sse` (vLLM-Omni) |
 +| `seed` | random | sampling seed |
 +| `temperature` | `0.9` | |
@@ -230,7 +230,7 @@ index 00000000..d2058a26
 +
 +| | |
 +|---|---|
-+| `GET /v1/audio/voices` | voices, languages, default voice, sample rate |
++| `GET /v1/audio/voices` | voices, languages, default voice, sample rate, the `response_format` values this build supports and the default one |
 +| `POST /v1/audio/speech/cancel` | stop the utterance being spoken (HTTP or WebSocket) |
 +
 +### One utterance at a time
@@ -282,7 +282,7 @@ index 00000000..d2058a26
 +
 +- Linux with the XRT runtime only. The integration drives FLM's prebuilt `qwen3_npu` engine through interposed XRT calls; it is validated against the engine libraries and xclbins listed under "Validated versions" and checks the engine's build shape at load (it refuses to start if that changes). Other engine builds are untested.
 +- Preset speakers of Qwen3-TTS-12Hz-1.7B-CustomVoice only: no instructions/tones, voice design or voice cloning.
-+- 24 kHz mono 16-bit PCM or WAV only; `speed` 1.0 only.
++- 24 kHz mono output; fixed bit rates (mp3 and aac 64 kbit/s, opus 32 kbit/s); `speed` 1.0 only.
 +- Audible failures remain. About 1 segment in 100 garbles. Later segments are usually caught and regenerated unheard; first segments and segments the detector misses are heard. Expect a few audible glitches per hour of speech.
 +- The garble detector's entropy threshold (1.7) was calibrated on the validated talker package (ASR-labeled LLM-reply segments), not on the reproducible one this pipeline builds. A spot check on the reproducible talker (the 224 derail-harness runs, code0 entropy teacher-forced through the NPU talker): 2 of 215 clean runs (0.9%) exceed 1.7 (validated calibration: 0.7%); of the 9 derailed runs, the entropy check flags 4 and the entropy and length checks together flag 8. The harness labels derails by length, code0 loops and leading silence rather than ASR, so this is a consistency check, not a recalibration. Recalibrate with `calibrate_entropy.py` (about 5 h) together with the next talker change (per-tone LoRA).
 +- Prosody can jump at segment joins, because each segment is generated independently (pitch jumps about 2× larger than within a segment). The per-tone LoRA work is meant to address this.

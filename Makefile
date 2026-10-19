@@ -38,7 +38,7 @@ image:
 	$(ENGINE) build -f support/Dockerfile.builder --build-arg BASE=$(BASE_IMAGE) -t $(BUILDER_IMAGE) support/
 
 build: image
-	$(RUN) bash -c 'cd src && { [ -f build/build.ninja ] || cmake --preset linux-default; } && cmake --build build -j$$(nproc)'
+	$(RUN) bash -c 'cd src && cmake --preset linux-default > /dev/null && cmake --build build -j$$(nproc)'
 
 test: image
 	$(RUN) bash -c 'cmake -S src/test/qwen3_tts -B src/build-tts-test -G Ninja && cmake --build src/build-tts-test && src/build-tts-test/test_tts_text'

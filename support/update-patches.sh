@@ -6,7 +6,7 @@
 #
 #   support/update-patches.sh [<dir>]     (default: src)
 #
-# Each patch is `git diff FLM_REF` of its own paths (committed and uncommitted changes
+# Each patch is `git diff FLM_REF` of its own paths (committed, uncommitted and new files
 # alike), so the patches stay independent: they never touch the same file. The
 # description before the first "diff --git" line of the existing patch is kept.
 #   0002-qwen3-tts-package-tools.patch  src/tools/qwen3_tts
@@ -17,6 +17,11 @@ root="$(cd "$here/.." && pwd)"
 dir="${1:-$root/src}"
 source "$here/upstream.env"
 tools='src/tools/qwen3_tts'
+
+# new files are untracked and `git diff` skips them: mark them intent-to-add first (build
+# directories excluded)
+git -C "$dir" ls-files -z --others --exclude-standard | grep -z -v -E '(^|/)build[^/]*/' |
+    xargs -0 -r git -C "$dir" add -N --
 
 header() { sed -n '/^diff --git /q;p' "$1"; }
 write() {

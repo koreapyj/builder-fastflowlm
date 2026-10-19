@@ -4234,12 +4234,321 @@ index 8d3d39d4..00393209 100644
  };
  
  // Forward declarations
+diff --git a/src/server/tts_encoder.cpp b/src/server/tts_encoder.cpp
+new file mode 100644
+index 00000000..6dcec460
+--- /dev/null
++++ b/src/server/tts_encoder.cpp
+@@ -0,0 +1,252 @@
++/*!
++ * \file tts_encoder.cpp
++ * \brief Compressed response formats for /v1/audio/speech (see tts_encoder.hpp)
++ */
++#ifdef FLM_QWEN3_TTS
++
++#include "tts_encoder.hpp"
++
++#include <algorithm>
++#include <cstring>
++#include <map>
++
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libavformat/avformat.h>
++#include <libavutil/channel_layout.h>
++#include <libavutil/opt.h>
++}
++
++namespace {
++
++struct Spec {
++    const char* muxer;
++    std::vector<const char*> encoders;   // by preference
++    int64_t bit_rate;                     // 0 = encoder default
++};
++
++// OpenAI's containers; bit rates for 24 kHz mono speech
++const std::map<std::string, Spec>& specs() {
++    static const std::map<std::string, Spec> s = {
++        {"mp3", {"mp3", {"libmp3lame", "libshine"}, 64000}},
++        {"opus", {"ogg", {"libopus"}, 32000}},
++        {"aac", {"adts", {"aac", "libfdk_aac"}, 64000}},
++        {"flac", {"flac", {"flac"}, 0}},
++    };
++    return s;
++}
++
++const AVCodec* find_encoder(const Spec& sp) {
++    for (const char* n : sp.encoders)
++        if (const AVCodec* c = avcodec_find_encoder_by_name(n)) return c;
++    return nullptr;
++}
++
++/// \brief the encoder's sample formats (AV_SAMPLE_FMT_NONE-terminated), across FFmpeg 6.1 .. 8
++const AVSampleFormat* sample_formats(const AVCodec* c) {
++#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
++    const void* cfg = nullptr;
++    int n = 0;
++    if (avcodec_get_supported_config(nullptr, c, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &cfg, &n) < 0) return nullptr;
++    return static_cast<const AVSampleFormat*>(cfg);
++#else
++    return c->sample_fmts;
++#endif
++}
++
++}  // namespace
++
++struct TtsEncoder::Impl {
++    Sink sink;
++    bool ok = true;
++    AVFormatContext* oc = nullptr;
++    AVCodecContext* cc = nullptr;
++    AVStream* st = nullptr;
++    AVFrame* frame = nullptr;
++    AVPacket* pkt = nullptr;
++    int frame_size = 0;
++    bool small_last = false;
++    int64_t pts = 0;
++    std::vector<int16_t> pending;
++
++#if LIBAVFORMAT_VERSION_MAJOR >= 61
++    static int write_cb(void* opaque, const uint8_t* buf, int n) {
++#else
++    static int write_cb(void* opaque, uint8_t* buf, int n) {
++#endif
++        auto* self = static_cast<Impl*>(opaque);
++        if (!self->ok || !self->sink(buf, (size_t)n)) {
++            self->ok = false;
++            return AVERROR(EIO);
++        }
++        return n;
++    }
++
++    ~Impl() {
++        if (frame) av_frame_free(&frame);
++        if (pkt) av_packet_free(&pkt);
++        if (cc) avcodec_free_context(&cc);
++        if (oc) {
++            if (oc->pb) {
++                av_freep(&oc->pb->buffer);
++                avio_context_free(&oc->pb);
++            }
++            avformat_free_context(oc);
++        }
++    }
++
++    bool drain() {
++        for (;;) {
++            const int r = avcodec_receive_packet(cc, pkt);
++            if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) return true;
++            if (r < 0) return ok = false;
++            av_packet_rescale_ts(pkt, cc->time_base, st->time_base);
++            pkt->stream_index = st->index;
++            if (av_write_frame(oc, pkt) < 0) ok = false;
++            av_packet_unref(pkt);
++            if (!ok) return false;
++        }
++    }
++
++    bool encode(const int16_t* x, int n) {
++        frame->nb_samples = n;
++        if (av_frame_make_writable(frame) < 0) return ok = false;
++        // mono: planar and interleaved layouts are the same
++        switch (cc->sample_fmt) {
++            case AV_SAMPLE_FMT_S16: case AV_SAMPLE_FMT_S16P:
++                std::memcpy(frame->data[0], x, (size_t)n * 2);
++                break;
++            case AV_SAMPLE_FMT_S32: case AV_SAMPLE_FMT_S32P: {
++                auto* d = reinterpret_cast<int32_t*>(frame->data[0]);
++                for (int i = 0; i < n; i++) d[i] = (int32_t)x[i] << 16;
++                break;
++            }
++            default: {   // FLT / FLTP
++                auto* d = reinterpret_cast<float*>(frame->data[0]);
++                for (int i = 0; i < n; i++) d[i] = x[i] / 32768.0f;
++            }
++        }
++        frame->pts = pts;
++        pts += n;
++        if (avcodec_send_frame(cc, frame) < 0) return ok = false;
++        return drain();
++    }
++};
++
++const std::vector<std::string>& TtsEncoder::available() {
++    static const std::vector<std::string> v = [] {
++        std::vector<std::string> out;
++        for (const char* f : {"mp3", "opus", "aac", "flac"}) {
++            const Spec& sp = specs().at(f);
++            if (find_encoder(sp) && av_guess_format(sp.muxer, nullptr, nullptr)) out.push_back(f);
++        }
++        return out;
++    }();
++    return v;
++}
++
++std::string TtsEncoder::content_type(const std::string& f) {
++    if (f == "mp3") return "audio/mpeg";
++    if (f == "opus") return "audio/opus";
++    if (f == "aac") return "audio/aac";
++    if (f == "flac") return "audio/flac";
++    if (f == "wav") return "audio/wav";
++    return "audio/pcm";
++}
++
++TtsEncoder::TtsEncoder(std::unique_ptr<Impl> p) : p_(std::move(p)) {}
++TtsEncoder::~TtsEncoder() = default;
++
++std::unique_ptr<TtsEncoder> TtsEncoder::create(const std::string& format, int rate, Sink sink) {
++    const auto it = specs().find(format);
++    if (it == specs().end()) return nullptr;
++    const Spec& sp = it->second;
++    const AVCodec* codec = find_encoder(sp);
++    if (!codec) return nullptr;
++    auto p = std::make_unique<Impl>();
++    p->sink = std::move(sink);
++    if (avformat_alloc_output_context2(&p->oc, nullptr, sp.muxer, nullptr) < 0 || !p->oc) return nullptr;
++    // custom, non-seekable output: bytes go to the sink as the muxer writes them
++    constexpr int kBuf = 4096;
++    auto* buf = static_cast<unsigned char*>(av_malloc(kBuf));
++    p->oc->pb = avio_alloc_context(buf, kBuf, 1, p.get(), nullptr, &Impl::write_cb, nullptr);
++    if (!p->oc->pb) { av_free(buf); return nullptr; }
++    p->oc->pb->seekable = 0;
++    p->oc->flags |= AVFMT_FLAG_CUSTOM_IO | AVFMT_FLAG_FLUSH_PACKETS;
++
++    p->cc = avcodec_alloc_context3(codec);
++    p->cc->sample_rate = rate;
++    av_channel_layout_default(&p->cc->ch_layout, 1);
++    p->cc->time_base = AVRational{1, rate};
++    if (sp.bit_rate) p->cc->bit_rate = sp.bit_rate;
++    AVSampleFormat pick = AV_SAMPLE_FMT_NONE;
++    if (const AVSampleFormat* f = sample_formats(codec)) {
++        for (AVSampleFormat want : {AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_S16P, AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_FLT,
++                                    AV_SAMPLE_FMT_S32, AV_SAMPLE_FMT_S32P}) {
++            for (const AVSampleFormat* q = f; *q != AV_SAMPLE_FMT_NONE; q++)
++                if (*q == want) { pick = want; break; }
++            if (pick != AV_SAMPLE_FMT_NONE) break;
++        }
++    } else {
++        pick = AV_SAMPLE_FMT_S16;
++    }
++    if (pick == AV_SAMPLE_FMT_NONE) return nullptr;
++    p->cc->sample_fmt = pick;
++    if (p->oc->oformat->flags & AVFMT_GLOBALHEADER) p->cc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
++    if (avcodec_open2(p->cc, codec, nullptr) < 0) return nullptr;
++
++    p->st = avformat_new_stream(p->oc, nullptr);
++    if (!p->st || avcodec_parameters_from_context(p->st->codecpar, p->cc) < 0) return nullptr;
++    p->st->time_base = p->cc->time_base;
++    AVDictionary* opts = nullptr;
++    if (format == "mp3") {
++        av_dict_set(&opts, "id3v2_version", "0", 0);   // no tags, no Xing frame: plain MPEG audio
++        av_dict_set(&opts, "write_xing", "0", 0);
++    }
++    if (format == "opus") av_dict_set(&opts, "page_duration", "100000", 0);   // 100 ms Ogg pages for streaming
++    const int hr = avformat_write_header(p->oc, &opts);
++    av_dict_free(&opts);
++    if (hr < 0 || !p->ok) return nullptr;
++    avio_flush(p->oc->pb);
++
++    p->frame_size = p->cc->frame_size > 0 ? p->cc->frame_size : 1152;
++    p->small_last = (codec->capabilities & (AV_CODEC_CAP_SMALL_LAST_FRAME | AV_CODEC_CAP_VARIABLE_FRAME_SIZE)) != 0;
++    p->frame = av_frame_alloc();
++    p->pkt = av_packet_alloc();
++    p->frame->format = p->cc->sample_fmt;
++    p->frame->sample_rate = rate;
++    av_channel_layout_copy(&p->frame->ch_layout, &p->cc->ch_layout);
++    p->frame->nb_samples = p->frame_size;
++    if (av_frame_get_buffer(p->frame, 0) < 0) return nullptr;
++    return std::unique_ptr<TtsEncoder>(new TtsEncoder(std::move(p)));
++}
++
++bool TtsEncoder::write(const int16_t* x, size_t n) {
++    Impl& P = *p_;
++    if (!P.ok) return false;
++    P.pending.insert(P.pending.end(), x, x + n);
++    size_t off = 0;
++    while (P.ok && P.pending.size() - off >= (size_t)P.frame_size) {
++        P.encode(P.pending.data() + off, P.frame_size);
++        off += P.frame_size;
++    }
++    P.pending.erase(P.pending.begin(), P.pending.begin() + off);
++    if (P.ok) avio_flush(P.oc->pb);
++    return P.ok;
++}
++
++bool TtsEncoder::finish() {
++    Impl& P = *p_;
++    if (!P.ok) return false;
++    if (!P.pending.empty()) {
++        if (!P.small_last) P.pending.resize(P.frame_size, 0);   // pad the last frame with silence
++        P.encode(P.pending.data(), (int)P.pending.size());
++        P.pending.clear();
++    }
++    if (P.ok && avcodec_send_frame(P.cc, nullptr) >= 0) P.drain();
++    if (P.ok && av_write_trailer(P.oc) < 0) P.ok = false;
++    if (P.ok) avio_flush(P.oc->pb);
++    return P.ok;
++}
++
++#endif  // FLM_QWEN3_TTS
+diff --git a/src/server/tts_encoder.hpp b/src/server/tts_encoder.hpp
+new file mode 100644
+index 00000000..601cdc76
+--- /dev/null
++++ b/src/server/tts_encoder.hpp
+@@ -0,0 +1,45 @@
++/*!
++ * \file tts_encoder.hpp
++ * \brief Compressed response formats for /v1/audio/speech (mp3, opus, aac, flac) via FFmpeg
++ *
++ * 16-bit mono PCM in, the container OpenAI returns for each format out: raw MPEG audio
++ * (mp3), Ogg Opus (opus), ADTS (aac), FLAC stream (flac). Output is produced as the PCM
++ * arrives, so it works for whole files and for streaming alike. Which formats exist depends
++ * on the FFmpeg the build links (e.g. no mp3 encoder in an LGPL-only FFmpeg).
++ */
++#pragma once
++
++#ifdef FLM_QWEN3_TTS
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <string>
++#include <vector>
++
++class TtsEncoder {
++public:
++    using Sink = std::function<bool(const uint8_t* data, size_t n)>;
++
++    /// \brief the compressed formats this build can produce (subset of mp3, opus, aac, flac)
++    static const std::vector<std::string>& available();
++    /// \brief Content-Type for a response_format (also wav and pcm)
++    static std::string content_type(const std::string& format);
++
++    /// \brief nullptr if the format is not available
++    static std::unique_ptr<TtsEncoder> create(const std::string& format, int sample_rate, Sink sink);
++
++    ~TtsEncoder();
++    /// \brief encode PCM; false once the sink refused data (client gone) or encoding failed
++    bool write(const int16_t* pcm, size_t n);
++    /// \brief flush the encoder and write the container trailer
++    bool finish();
++
++    struct Impl;
++private:
++    explicit TtsEncoder(std::unique_ptr<Impl> p);
++    std::unique_ptr<Impl> p_;
++};
++
++#endif  // FLM_QWEN3_TTS
 diff --git a/src/server/tts_service.cpp b/src/server/tts_service.cpp
 new file mode 100644
-index 00000000..ad06353a
+index 00000000..7eae0f38
 --- /dev/null
 +++ b/src/server/tts_service.cpp
-@@ -0,0 +1,541 @@
+@@ -0,0 +1,605 @@
 +/*!
 + * \file tts_service.cpp
 + * \brief Text-to-speech endpoints (see tts_service.hpp)
@@ -4251,6 +4560,7 @@ index 00000000..ad06353a
 +#include <boost/beast/websocket.hpp>
 +
 +#include <cstdlib>
++#include <algorithm>
 +#include <deque>
 +#include <filesystem>
 +#include <iostream>
@@ -4258,6 +4568,7 @@ index 00000000..ad06353a
 +
 +#include "base64.hpp"
 +#include "server.hpp"
++#include "tts_encoder.hpp"
 +#include "utils/debug_utils.hpp"
 +
 +namespace websocket = beast::websocket;
@@ -4282,6 +4593,24 @@ index 00000000..ad06353a
 +    h.replace(36, 4, "data");
 +    u32(40, data_bytes);
 +    return h;
++}
++
++/// \brief response_format values this build supports, in OpenAI's order
++std::vector<std::string> response_formats() {
++    std::vector<std::string> v;
++    for (const char* f : {"mp3", "opus", "aac", "flac"}) {
++        const auto& a = TtsEncoder::available();
++        if (std::find(a.begin(), a.end(), f) != a.end()) v.push_back(f);
++    }
++    v.push_back("wav");
++    v.push_back("pcm");
++    return v;
++}
++
++/// \brief OpenAI's default (mp3), or wav where the build has no mp3 encoder
++std::string default_format() {
++    const auto& a = TtsEncoder::available();
++    return std::find(a.begin(), a.end(), "mp3") != a.end() ? "mp3" : "wav";
 +}
 +
 +json error_json(int code, const std::string& msg) { return json{{"error", {{"code", code}, {"message", msg}}}}; }
@@ -4645,8 +4974,16 @@ index 00000000..ad06353a
 +            if (j.contains("model") && j["model"].is_string() && !j["model"].get<std::string>().empty() &&
 +                j["model"] != self->tag() && j["model"] != "tts-1" && j["model"] != "tts-1-hd")
 +                { send_response(error_json(400, "model " + j["model"].get<std::string>() + " is not loaded; this server speaks with " + self->tag())); return; }
-+            const std::string fmt = j.value("response_format", "wav");
-+            if (fmt != "wav" && fmt != "pcm") { send_response(error_json(400, "response_format must be wav or pcm")); return; }
++            const std::string fmt = j.value("response_format", default_format());
++            const auto formats = response_formats();
++            if (std::find(formats.begin(), formats.end(), fmt) == formats.end()) {
++                std::string list;
++                for (size_t i = 0; i < formats.size(); i++)
++                    list += (i == 0 ? "" : i + 1 == formats.size() ? " or " : ", ") + formats[i];
++                send_response(error_json(400, "response_format must be " + list));
++                return;
++            }
++            const bool encoded = fmt != "wav" && fmt != "pcm";
 +            if (j.contains("speed") && j["speed"].is_number() && std::abs(j["speed"].get<double>() - 1.0) > 1e-6)
 +                { send_response(error_json(400, "only speed 1.0 is supported")); return; }
 +            if (j.contains("sample_rate") && j["sample_rate"].is_number_integer() && j["sample_rate"].get<int>() != kRate)
@@ -4674,11 +5011,39 @@ index 00000000..ad06353a
 +
 +            const std::vector<std::pair<std::string, std::string>> hdr = {
 +                {"x-audio-sample-rate", std::to_string(kRate)}, {"x-audio-channels", "1"}};
-+            const std::string ctype = fmt == "wav" ? "audio/wav" : "audio/pcm";
++            const std::string ctype = TtsEncoder::content_type(fmt);
 +            std::vector<int16_t> all;
 +            bool started = false;
 +            TtsSink sink;
++            // compressed formats: PCM goes through an encoder whose output goes where the PCM
++            // (or wav) bytes would have gone; created at the first audio, so a request that fails
++            // before any audio still gets an HTTP error
++            std::unique_ptr<TtsEncoder> enc;
++            std::string whole;   // whole-file mode, compressed
++            std::function<bool(const uint8_t*, size_t)> emit;
 +            if (sfmt == "audio") {
++                emit = [&](const uint8_t* b, size_t n) {
++                    if (!started) { started = true; if (!session->write_raw_head(200, ctype, hdr, true)) return false; }
++                    return session->write_raw_chunk(b, n);
++                };
++            } else if (sfmt == "sse") {
++                emit = [&](const uint8_t* b, size_t n) {
++                    started = true;
++                    json ev = {{"type", "speech.audio.delta"},
++                               {"audio", base64::to_base64(std::string_view(reinterpret_cast<const char*>(b), n))}};
++                    send_streaming_response("data: " + ev.dump() + "\n\n", false);
++                    return !token->cancelled();
++                };
++            } else {
++                emit = [&](const uint8_t* b, size_t n) { whole.append(reinterpret_cast<const char*>(b), n); return true; };
++            }
++            auto make_encoder = [&] {
++                if (!enc) enc = TtsEncoder::create(fmt, kRate, emit);
++                return enc != nullptr;
++            };
++            if (encoded) {
++                sink.audio = [&](const int16_t* pcm, size_t n) { return make_encoder() && enc->write(pcm, n); };
++            } else if (sfmt == "audio") {
 +                sink.audio = [&](const int16_t* pcm, size_t n) {
 +                    if (!started) {
 +                        started = true;
@@ -4705,7 +5070,14 @@ index 00000000..ad06353a
 +            auto r = eng.speak(rq, *in, sink, [&] { return cancel.load() || token->cancelled(); });
 +            self->end_utterance(act);
 +            WsSession::log_metrics("http", r);
-+            const bool failed = r.status == TtsResult::error || r.status == TtsResult::fault;
++            bool failed = r.status == TtsResult::error || r.status == TtsResult::fault;
++            if (encoded && r.status == TtsResult::ok) {
++                // the trailer (and, for an utterance with no audio at all, a valid empty file)
++                if (!make_encoder() || !enc->finish()) {
++                    failed = true;
++                    if (r.message.empty()) r.message = "encoding " + fmt + " failed";
++                }
++            }
 +            if (sfmt == "audio") {
 +                if (started) { session->write_raw_end(); return; }
 +                if (failed) { send_response(error_json(r.status == TtsResult::fault ? 503 : 500, r.message)); return; }
@@ -4748,8 +5120,8 @@ index 00000000..ad06353a
 +            }
 +            if (failed) { send_response(error_json(r.status == TtsResult::fault ? 503 : 500, r.message)); return; }
 +            if (r.status == TtsResult::cancelled && token->cancelled()) return;   // client is gone
-+            std::string body = fmt == "wav" ? wav_header((uint32_t)(all.size() * 2)) : std::string();
-+            body.append(reinterpret_cast<const char*>(all.data()), all.size() * 2);
++            std::string body = encoded ? std::move(whole) : fmt == "wav" ? wav_header((uint32_t)(all.size() * 2)) : std::string();
++            if (!encoded) body.append(reinterpret_cast<const char*>(all.data()), all.size() * 2);
 +            auto h2 = hdr;
 +            json m = r.metrics;
 +            m.erase("segment_log");
@@ -4763,6 +5135,7 @@ index 00000000..ad06353a
 +               std::function<void(const json&, bool)>, std::shared_ptr<HttpSession>, std::shared_ptr<CancellationToken>) {
 +            send_response(json{{"model", self->tag()}, {"voices", self->engine().voices()},
 +                               {"languages", self->engine().languages()}, {"default_voice", self->engine().default_voice()},
++                               {"response_formats", response_formats()}, {"default_response_format", default_format()},
 +                               {"sample_rate", kRate}});
 +        });
 +
